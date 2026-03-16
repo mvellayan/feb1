@@ -1,5 +1,5 @@
 Index,Column Name,Description,Ref Info
-1,date,Quot date,
+1,date,"Quote date -- unique, sorted by this column",
 2,vix,CBOE  implied  Volatility Index,
 3,open,First traded price,https://interactivebrokers.github.io/tws-api/historical_bars.html
 4,high,Highest traded price,

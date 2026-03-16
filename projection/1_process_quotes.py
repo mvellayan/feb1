@@ -44,15 +44,16 @@ def main():
                            'symbol', 'localSymbol', 'conId']]
     print(trades_pd.columns)
 
-    # Sequence column names
-    # trades_pd.insert(2, 'vix', trades_pd.pop('vix'))
+
+    # sort by date
+    trades_pd.sort_values(by=['date'], inplace=True)
+
     trades_pd.to_csv("../data/projection.csv", float_format="%.3f", index=False)
 
     pd.set_option('display.max_colwidth', 20000)
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', None)
     print(trades_pd.head())
-    print(trades_pd.head)
     print(trades_pd.describe())
 
 
