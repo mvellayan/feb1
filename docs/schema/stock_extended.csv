@@ -1,5 +1,5 @@
 Index,Column Name,Prefix,Description
---- RAW COLUMNS (from sq-AAPL.csv) ---
+--- RAW COLUMNS (from sq_AAPL.csv) ---
 1,date,,Quote datetime -- unique, sorted ascending
 2,vix,,CBOE Implied Volatility Index at bar time
 3,open,,First traded price of the bar
@@ -24,7 +24,7 @@ Index,Column Name,Prefix,Description
 20,fnd_prev_close,fnd_,close.shift(1) -- prior bar close
 21,fnd_close_chg,fnd_,close - prev_close -- bar price change
 22,fnd_abs_chg,fnd_,abs(close_change) -- absolute price change
-23,fnd_true_range,fnd_,max(H-L, |H-prevC|, |L-prevC|) -- shared by ATR/ADX/Choppiness
+23,fnd_true_range,fnd_,max(H-L |H-prevC| |L-prevC|) -- shared by ATR/ADX/Choppiness
 24,fnd_high_14,fnd_,Rolling 14-bar highest high -- shared by Stochastic/Choppiness
 25,fnd_low_14,fnd_,Rolling 14-bar lowest low -- shared by Stochastic/Choppiness
 26,fnd_trade_date,fnd_,Date-only portion of datetime -- used to reset VWAP each session
@@ -105,7 +105,7 @@ Index,Column Name,Prefix,Description
 83,chp_14,chp_,Choppiness Index (14-period) -- scale 1-100
 84,chp_trending,chp_,1 if chp_14 < 38.2 (clearly trending) else 0
 85,chp_ranging,chp_,1 if chp_14 > 61.8 (clearly choppy) else 0
-86,chp_regime,chp_,String label: 'trend' / 'range' / 'neutral'
+86,chp_regime,chp_,String label: trend / range / neutral
 
 --- VWAP columns (vwp_) ---
 87,vwp_pv,vwp_,Price x Volume -- cumulative numerator for VWAP
@@ -135,3 +135,78 @@ Index,Column Name,Prefix,Description
 105,ses_after_10,ses_,1 if bar is at or after 10:00 AM (valid entry window) else 0
 106,ses_before_345,ses_,1 if bar is before 3:45 PM (safe new-entry window) else 0
 107,ses_minute,ses_,Minutes since midnight (hour*60 + minute) -- for time-based rules
+
+--- PARABOLIC SAR columns (sar_) ---
+108,sar_value,sar_,SAR price level for the current bar
+109,sar_bull,sar_,1 if price > SAR (uptrend) else 0 (downtrend)
+110,sar_flip_bull,sar_,1 on bar where SAR flips from bearish to bullish (entry signal) else 0
+
+--- DONCHIAN CHANNELS columns (don_) ---
+111,don_upper_20,don_,20-period rolling highest high
+112,don_lower_20,don_,20-period rolling lowest low
+113,don_mid_20,don_,(don_upper_20 + don_lower_20) / 2 -- channel midpoint
+114,don_width,don_,don_upper_20 - don_lower_20 -- channel width
+115,don_breakout_up,don_,1 if close > prior bar don_upper_20 (breakout signal) else 0
+116,don_bull,don_,1 if close > don_mid_20 else 0
+
+--- AROON columns (arn_) ---
+117,arn_up,arn_,Aroon Up (0-100) -- 100 x (25 - bars since 25-period high) / 25
+118,arn_dn,arn_,Aroon Down (0-100) -- 100 x (25 - bars since 25-period low) / 25
+119,arn_osc,arn_,Aroon Oscillator = arn_up - arn_dn (-100 to +100)
+120,arn_bull,arn_,1 if arn_up > 70 AND arn_dn < 30 (strong uptrend) else 0
+121,arn_cross_up,arn_,1 on bar where Aroon Up crosses above Aroon Down else 0
+
+--- VORTEX columns (vtx_) ---
+122,vtx_plus,vtx_,VI+ = sum(|high - prev_low|) / sum(true_range) over 14 bars
+123,vtx_minus,vtx_,VI- = sum(|low - prev_high|) / sum(true_range) over 14 bars
+124,vtx_bull,vtx_,1 if vtx_plus > vtx_minus else 0
+125,vtx_cross_up,vtx_,1 on bar where VI+ crosses above VI- else 0
+
+--- CHANDE MOMENTUM OSCILLATOR columns (cmo_) ---
+126,cmo_14,cmo_,CMO value (-100 to +100) -- 14-period
+127,cmo_bull,cmo_,1 if cmo_14 > 0 else 0
+128,cmo_cross_0,cmo_,1 on bar where CMO crosses above 0 from below else 0
+
+--- TRUE STRENGTH INDEX columns (tsi_) ---
+129,tsi_val,tsi_,TSI value -- double-smoothed momentum (EMA25 of EMA13)
+130,tsi_signal,tsi_,TSI signal line = 13-period EMA of tsi_val
+131,tsi_bull,tsi_,1 if tsi_val > 0 else 0
+132,tsi_cross_0,tsi_,1 on bar where TSI crosses above 0 from below else 0
+133,tsi_cross_sig,tsi_,1 on bar where TSI crosses above signal line else 0
+
+--- RATE OF CHANGE columns (roc_) ---
+134,roc_12,roc_,ROC = ((close - close[12]) / close[12]) * 100 -- 12-period
+135,roc_bull,roc_,1 if roc_12 > 0 else 0
+136,roc_cross_0,roc_,1 on bar where ROC crosses above 0 from below else 0
+
+--- FORCE INDEX columns (frc_) ---
+137,frc_raw,frc_,Raw Force Index = close_change x volume
+138,frc_ema_2,frc_,2-period EMA of frc_raw (fast)
+139,frc_ema_13,frc_,13-period EMA of frc_raw (main signal)
+140,frc_bull,frc_,1 if frc_ema_13 > 0 else 0
+141,frc_cross_0,frc_,1 on bar where frc_ema_13 crosses above 0 else 0
+
+--- STOCHASTIC RSI columns (srsi_) ---
+142,srsi_k,srsi_,Stochastic %K applied to RSI values (0-100)
+143,srsi_d,srsi_,3-period SMA of srsi_k (signal line)
+144,srsi_cross_up,srsi_,1 on bar where srsi_k crosses above srsi_d else 0
+145,srsi_oversold,srsi_,1 if srsi_k < 20 else 0
+146,srsi_overbought,srsi_,1 if srsi_k > 80 else 0
+
+--- RELATIVE MOMENTUM INDEX columns (rmi_) ---
+147,rmi_14,rmi_,RMI value (0-100) -- RSI using 3-bar momentum over 14-period
+148,rmi_cross_50,rmi_,1 on bar where RMI crosses above 50 from below else 0
+149,rmi_oversold,rmi_,1 if rmi_14 < 30 else 0
+150,rmi_overbought,rmi_,1 if rmi_14 > 70 else 0
+
+--- KLINGER VOLUME OSCILLATOR columns (klg_) ---
+151,klg_vf,klg_,Volume Force -- raw KVO input
+152,klg_line,klg_,KVO line = EMA(34) - EMA(55) of volume force
+153,klg_signal,klg_,KVO signal line = 13-period EMA of klg_line
+154,klg_bull,klg_,1 if klg_line > klg_signal else 0
+155,klg_cross_sig,klg_,1 on bar where KVO crosses above signal line else 0
+
+--- VOLUME RATE OF CHANGE columns (vrc_) ---
+156,vrc_14,vrc_,Volume ROC = ((volume - volume[14]) / volume[14]) * 100
+157,vrc_pos,vrc_,1 if vrc_14 > 0 (volume expanding vs 14 bars ago) else 0
+158,vrc_spike,vrc_,1 if vrc_14 > 50 (volume up more than 50%) else 0

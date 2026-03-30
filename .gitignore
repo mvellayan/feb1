@@ -5,6 +5,7 @@ __pycache__/
 
 # data directory contents
 data/
+reports/
 .venv/
 
 # C extensions

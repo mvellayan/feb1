@@ -2,7 +2,8 @@
 compute_indicators.py
 
 Computes all technical indicator intermediate columns for intraday AAPL backtesting.
-Reads sq-AAPL.csv, adds ~70 computed columns with consistent prefixes, writes sq-AAPL-extended.csv.
+Reads sq_AAPL.csv, adds ~140 computed columns with consistent prefixes,
+writes sq_AAPL_extended.csv.
 
 Column prefix conventions:
   fnd_   Foundation / price primitives
@@ -18,6 +19,20 @@ Column prefix conventions:
   vwp_   VWAP (intraday, session-reset)
   obv_   On Balance Volume
   mfi_   Money Flow Index
+  ses_   Session time flags
+  --- NEW (13 additional indicators) ---
+  sar_   Parabolic SAR
+  don_   Donchian Channels
+  arn_   Aroon Up / Down / Oscillator
+  vtx_   Vortex Indicator (VI+ / VI-)
+  cmo_   Chande Momentum Oscillator
+  tsi_   True Strength Index
+  roc_   Rate of Change
+  frc_   Force Index
+  srsi_  Stochastic RSI
+  rmi_   Relative Momentum Index
+  klg_   Klinger Volume Oscillator
+  vrc_   Volume Rate of Change
 """
 
 import numpy as np
@@ -41,6 +56,115 @@ def _wilder_smooth(series: pd.Series, period: int) -> pd.Series:
 def _rolling_apply_mean_dev(series: pd.Series, window: int) -> pd.Series:
     """Mean absolute deviation over a rolling window — required for CCI."""
     return series.rolling(window).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+
+
+def _compute_parabolic_sar(
+    high: pd.Series, low: pd.Series,
+    af_start: float = 0.02, af_step: float = 0.02, af_max: float = 0.20
+) -> tuple:
+    """
+    Full iterative Parabolic SAR computation.
+    Returns (sar_series, bull_series) where bull=1 means price > SAR (uptrend).
+    Cannot be vectorized due to state dependency between bars.
+    """
+    n = len(high)
+    sar  = np.zeros(n, dtype=np.float64)
+    ep   = np.zeros(n, dtype=np.float64)   # extreme point
+    af   = np.zeros(n, dtype=np.float64)   # acceleration factor
+    bull = np.zeros(n, dtype=np.int8)      # 1 = uptrend
+
+    hi = high.values
+    lo = low.values
+
+    # Seed: assume uptrend on first bar
+    bull[0] = 1
+    sar[0]  = lo[0]
+    ep[0]   = hi[0]
+    af[0]   = af_start
+
+    for i in range(1, n):
+        pb, ps, pe, pa = bull[i-1], sar[i-1], ep[i-1], af[i-1]
+        new_sar = ps + pa * (pe - ps)
+
+        if pb == 1:                             # uptrend
+            new_sar = min(new_sar, lo[i-1])
+            if i >= 2:
+                new_sar = min(new_sar, lo[i-2])
+            if lo[i] < new_sar:                 # reversal to downtrend
+                bull[i] = 0
+                sar[i]  = pe
+                ep[i]   = lo[i]
+                af[i]   = af_start
+            else:
+                bull[i] = 1
+                sar[i]  = new_sar
+                if hi[i] > pe:
+                    ep[i] = hi[i]
+                    af[i] = min(pa + af_step, af_max)
+                else:
+                    ep[i] = pe
+                    af[i] = pa
+        else:                                   # downtrend
+            new_sar = max(new_sar, hi[i-1])
+            if i >= 2:
+                new_sar = max(new_sar, hi[i-2])
+            if hi[i] > new_sar:                 # reversal to uptrend
+                bull[i] = 1
+                sar[i]  = pe
+                ep[i]   = hi[i]
+                af[i]   = af_start
+            else:
+                bull[i] = 0
+                sar[i]  = new_sar
+                if lo[i] < pe:
+                    ep[i] = lo[i]
+                    af[i] = min(pa + af_step, af_max)
+                else:
+                    ep[i] = pe
+                    af[i] = pa
+
+    return (
+        pd.Series(sar,  index=high.index, dtype=np.float32),
+        pd.Series(bull, index=high.index, dtype=np.int8),
+    )
+
+
+def _compute_klinger(
+    high: pd.Series, low: pd.Series,
+    close: pd.Series, volume: pd.Series,
+    fast: int = 34, slow: int = 55, signal: int = 13
+) -> tuple:
+    """
+    Klinger Volume Oscillator.
+    Returns (vf_series, kvo_line, kvo_signal) — all pd.Series.
+    The CM (cumulative measurement) state requires an explicit loop.
+    """
+    n   = len(close)
+    tp  = (high + low + close).values
+    dm  = (high - low).values
+    vol = volume.values
+
+    trend = np.zeros(n, dtype=np.float64)
+    cm    = np.zeros(n, dtype=np.float64)
+    vf    = np.zeros(n, dtype=np.float64)
+
+    for i in range(1, n):
+        trend[i] = 1.0 if tp[i] > tp[i-1] else -1.0
+
+    cm[0] = dm[0]
+    for i in range(1, n):
+        cm[i] = (cm[i-1] + dm[i]) if trend[i] == trend[i-1] else (dm[i-1] + dm[i])
+
+    for i in range(n):
+        if cm[i] != 0:
+            vf[i] = vol[i] * abs(2.0 * (dm[i] / cm[i]) - 1.0) * trend[i] * 100.0
+
+    vf_s    = pd.Series(vf, index=close.index)
+    kvo     = vf_s.ewm(span=fast, adjust=False).mean() - \
+              vf_s.ewm(span=slow, adjust=False).mean()
+    kvo_sig = kvo.ewm(span=signal, adjust=False).mean()
+
+    return vf_s.astype(np.float32), kvo.astype(np.float32), kvo_sig.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +474,254 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ).astype(np.int8)                                               # oversold bounce
 
     # -----------------------------------------------------------------------
+    # Defragment before adding the 13 new indicator groups
+    # (avoids pandas PerformanceWarning from many sequential column inserts)
+    # -----------------------------------------------------------------------
+    df = df.copy()
+
+    # -----------------------------------------------------------------------
+    # PARABOLIC SAR  (prefix: sar_)
+    # -----------------------------------------------------------------------
+
+    df['sar_value'], df['sar_bull'] = _compute_parabolic_sar(df['high'], df['low'])
+
+    sar_bull_prev          = df['sar_bull'].shift(1).fillna(0).astype(np.int8)
+    df['sar_flip_bull']    = (
+        (df['sar_bull'] == 1) & (sar_bull_prev == 0)
+    ).astype(np.int8)                                               # SAR just flipped bullish
+
+    # -----------------------------------------------------------------------
+    # DONCHIAN CHANNELS  (prefix: don_)
+    # -----------------------------------------------------------------------
+
+    # Use period=20; upper = highest high, lower = lowest low over 20 bars
+    # The breakout signal uses the PRIOR bar's channel to avoid look-ahead
+    df['don_upper_20']     = df['high'].rolling(20).max()
+    df['don_lower_20']     = df['low'].rolling(20).min()
+    df['don_mid_20']       = (df['don_upper_20'] + df['don_lower_20']) / 2.0
+    df['don_width']        = df['don_upper_20'] - df['don_lower_20']
+
+    # Breakout: close exceeds the PRIOR bar's upper channel (avoids look-ahead)
+    df['don_breakout_up']  = (
+        df['close'] > df['don_upper_20'].shift(1)
+    ).astype(np.int8)
+    df['don_bull']         = (df['close'] > df['don_mid_20']).astype(np.int8)
+
+    # -----------------------------------------------------------------------
+    # AROON UP / DOWN / OSCILLATOR  (prefix: arn_)
+    # Period = 25 (standard)
+    # -----------------------------------------------------------------------
+
+    arn_period = 25
+
+    # bars_since_high: position of rolling max within the window (0 = most recent)
+    def _bars_since_high(s, w):
+        return s.rolling(w + 1).apply(
+            lambda x: w - np.argmax(x), raw=True
+        )
+
+    def _bars_since_low(s, w):
+        return s.rolling(w + 1).apply(
+            lambda x: w - np.argmin(x), raw=True
+        )
+
+    bars_high              = _bars_since_high(df['high'], arn_period)
+    bars_low               = _bars_since_low(df['low'],  arn_period)
+
+    df['arn_up']           = (100.0 * (arn_period - bars_high) / arn_period).astype(np.float32)
+    df['arn_dn']           = (100.0 * (arn_period - bars_low)  / arn_period).astype(np.float32)
+    df['arn_osc']          = (df['arn_up'] - df['arn_dn']).astype(np.float32)
+
+    arn_up_prev            = df['arn_up'].shift(1)
+    arn_dn_prev            = df['arn_dn'].shift(1)
+    df['arn_bull']         = (
+        (df['arn_up'] > 70) & (df['arn_dn'] < 30)
+    ).astype(np.int8)
+    df['arn_cross_up']     = (
+        (df['arn_up'] > df['arn_dn']) & (arn_up_prev <= arn_dn_prev)
+    ).astype(np.int8)                                               # Aroon Up crosses above Down
+
+    # -----------------------------------------------------------------------
+    # VORTEX INDICATOR  (prefix: vtx_)
+    # Period = 14
+    # -----------------------------------------------------------------------
+
+    vtx_period = 14
+    vm_plus    = (df['high'] - df['low'].shift(1)).abs()
+    vm_minus   = (df['low']  - df['high'].shift(1)).abs()
+
+    vm_plus_sum  = vm_plus.rolling(vtx_period).sum()
+    vm_minus_sum = vm_minus.rolling(vtx_period).sum()
+    tr_sum_vtx   = df['fnd_true_range'].rolling(vtx_period).sum()
+
+    df['vtx_plus']         = (vm_plus_sum  / tr_sum_vtx.replace(0, np.nan)).astype(np.float32)
+    df['vtx_minus']        = (vm_minus_sum / tr_sum_vtx.replace(0, np.nan)).astype(np.float32)
+
+    vtx_plus_prev          = df['vtx_plus'].shift(1)
+    vtx_minus_prev         = df['vtx_minus'].shift(1)
+    df['vtx_bull']         = (df['vtx_plus'] > df['vtx_minus']).astype(np.int8)
+    df['vtx_cross_up']     = (
+        (df['vtx_plus'] > df['vtx_minus']) &
+        (vtx_plus_prev <= vtx_minus_prev)
+    ).astype(np.int8)                                               # VI+ crosses above VI-
+
+    # -----------------------------------------------------------------------
+    # CHANDE MOMENTUM OSCILLATOR  (prefix: cmo_)
+    # Period = 14
+    # -----------------------------------------------------------------------
+
+    cmo_period  = 14
+    cmo_up      = df['fnd_close_chg'].clip(lower=0)
+    cmo_dn      = (-df['fnd_close_chg']).clip(lower=0)
+
+    cmo_up_sum  = cmo_up.rolling(cmo_period).sum()
+    cmo_dn_sum  = cmo_dn.rolling(cmo_period).sum()
+    cmo_denom   = (cmo_up_sum + cmo_dn_sum).replace(0, np.nan)
+
+    df['cmo_14']           = (100.0 * (cmo_up_sum - cmo_dn_sum) / cmo_denom).astype(np.float32)
+
+    cmo_prev               = df['cmo_14'].shift(1)
+    df['cmo_bull']         = (df['cmo_14'] > 0).astype(np.int8)
+    df['cmo_cross_0']      = (
+        (df['cmo_14'] > 0) & (cmo_prev <= 0)
+    ).astype(np.int8)
+
+    # -----------------------------------------------------------------------
+    # TRUE STRENGTH INDEX  (prefix: tsi_)
+    # Double-smoothed momentum: EMA(25) of EMA(13) of price change
+    # -----------------------------------------------------------------------
+
+    mom                    = df['fnd_close_chg']
+    mom_abs                = df['fnd_abs_chg']
+
+    # Double EMA smoothing (25 then 13)
+    tsi_smooth1            = mom.ewm(span=25, adjust=False).mean()
+    tsi_smooth2            = tsi_smooth1.ewm(span=13, adjust=False).mean()
+    tsi_abs1               = mom_abs.ewm(span=25, adjust=False).mean()
+    tsi_abs2               = tsi_abs1.ewm(span=13, adjust=False).mean()
+
+    df['tsi_val']          = (100.0 * tsi_smooth2 / tsi_abs2.replace(0, np.nan)).astype(np.float32)
+    df['tsi_signal']       = df['tsi_val'].ewm(span=13, adjust=False).mean().astype(np.float32)
+
+    tsi_prev               = df['tsi_val'].shift(1)
+    tsi_sig_prev           = df['tsi_signal'].shift(1)
+    df['tsi_bull']         = (df['tsi_val'] > 0).astype(np.int8)
+    df['tsi_cross_0']      = (
+        (df['tsi_val'] > 0) & (tsi_prev <= 0)
+    ).astype(np.int8)
+    df['tsi_cross_sig']    = (
+        (df['tsi_val'] > df['tsi_signal']) & (tsi_prev <= tsi_sig_prev)
+    ).astype(np.int8)                                               # TSI crosses above signal
+
+    # -----------------------------------------------------------------------
+    # RATE OF CHANGE  (prefix: roc_)
+    # Period = 12;  ROC = ((close - close[12]) / close[12]) * 100
+    # -----------------------------------------------------------------------
+
+    roc_period             = 12
+    close_n                = df['close'].shift(roc_period)
+    df['roc_12']           = (
+        100.0 * (df['close'] - close_n) / close_n.replace(0, np.nan)
+    ).astype(np.float32)
+
+    roc_prev               = df['roc_12'].shift(1)
+    df['roc_bull']         = (df['roc_12'] > 0).astype(np.int8)
+    df['roc_cross_0']      = (
+        (df['roc_12'] > 0) & (roc_prev <= 0)
+    ).astype(np.int8)
+
+    # -----------------------------------------------------------------------
+    # FORCE INDEX  (prefix: frc_)
+    # Raw = close_change × volume; smoothed with 2-period and 13-period EMA
+    # -----------------------------------------------------------------------
+
+    df['frc_raw']          = (df['fnd_close_chg'] * df['volume']).astype(np.float32)
+    df['frc_ema_2']        = df['frc_raw'].ewm(span=2,  adjust=False).mean().astype(np.float32)
+    df['frc_ema_13']       = df['frc_raw'].ewm(span=13, adjust=False).mean().astype(np.float32)
+
+    frc_prev               = df['frc_ema_13'].shift(1)
+    df['frc_bull']         = (df['frc_ema_13'] > 0).astype(np.int8)
+    df['frc_cross_0']      = (
+        (df['frc_ema_13'] > 0) & (frc_prev <= 0)
+    ).astype(np.int8)
+
+    # -----------------------------------------------------------------------
+    # STOCHASTIC RSI  (prefix: srsi_)
+    # Applies Stochastic formula to RSI values; period = 14 for both
+    # -----------------------------------------------------------------------
+
+    rsi_min_14             = df['rsi_14'].rolling(14).min()
+    rsi_max_14             = df['rsi_14'].rolling(14).max()
+    rsi_range_14           = (rsi_max_14 - rsi_min_14).replace(0, np.nan)
+
+    df['srsi_k']           = (
+        100.0 * (df['rsi_14'] - rsi_min_14) / rsi_range_14
+    ).astype(np.float32)
+    df['srsi_d']           = df['srsi_k'].rolling(3).mean().astype(np.float32)
+
+    srsi_k_prev            = df['srsi_k'].shift(1)
+    srsi_d_prev            = df['srsi_d'].shift(1)
+    df['srsi_cross_up']    = (
+        (df['srsi_k'] > df['srsi_d']) & (srsi_k_prev <= srsi_d_prev)
+    ).astype(np.int8)
+    df['srsi_oversold']    = (df['srsi_k'] < 20).astype(np.int8)
+    df['srsi_overbought']  = (df['srsi_k'] > 80).astype(np.int8)
+
+    # -----------------------------------------------------------------------
+    # RELATIVE MOMENTUM INDEX  (prefix: rmi_)
+    # Like RSI but uses n-bar momentum instead of 1-bar changes.
+    # Period = 14, momentum lookback = 3
+    # -----------------------------------------------------------------------
+
+    rmi_mom_period = 3
+    rmi_period     = 14
+    rmi_chg        = df['close'] - df['close'].shift(rmi_mom_period)
+    rmi_gain       = rmi_chg.clip(lower=0)
+    rmi_loss       = (-rmi_chg).clip(lower=0)
+
+    rmi_avg_gain   = _wilder_smooth(rmi_gain, rmi_period)
+    rmi_avg_loss   = _wilder_smooth(rmi_loss, rmi_period)
+    rmi_rs         = rmi_avg_gain / rmi_avg_loss.replace(0, np.nan)
+    df['rmi_14']   = (100.0 - 100.0 / (1.0 + rmi_rs)).astype(np.float32)
+
+    rmi_prev               = df['rmi_14'].shift(1)
+    df['rmi_cross_50']     = (
+        (df['rmi_14'] > 50) & (rmi_prev <= 50)
+    ).astype(np.int8)
+    df['rmi_oversold']     = (df['rmi_14'] < 30).astype(np.int8)
+    df['rmi_overbought']   = (df['rmi_14'] > 70).astype(np.int8)
+
+    # -----------------------------------------------------------------------
+    # KLINGER VOLUME OSCILLATOR  (prefix: klg_)
+    # Requires stateful CM computation — uses helper function.
+    # -----------------------------------------------------------------------
+
+    df['klg_vf'], df['klg_line'], df['klg_signal'] = _compute_klinger(
+        df['high'], df['low'], df['close'], df['volume']
+    )
+
+    klg_line_prev          = df['klg_line'].shift(1)
+    klg_sig_prev           = df['klg_signal'].shift(1)
+    df['klg_bull']         = (df['klg_line'] > df['klg_signal']).astype(np.int8)
+    df['klg_cross_sig']    = (
+        (df['klg_line'] > df['klg_signal']) & (klg_line_prev <= klg_sig_prev)
+    ).astype(np.int8)                                               # KVO crosses above signal
+
+    # -----------------------------------------------------------------------
+    # VOLUME RATE OF CHANGE  (prefix: vrc_)
+    # Period = 14
+    # -----------------------------------------------------------------------
+
+    vrc_period             = 14
+    vol_n                  = df['volume'].shift(vrc_period)
+    df['vrc_14']           = (
+        100.0 * (df['volume'] - vol_n) / vol_n.replace(0, np.nan)
+    ).astype(np.float32)
+
+    df['vrc_pos']          = (df['vrc_14'] > 0).astype(np.int8)    # volume expanding
+    df['vrc_spike']        = (df['vrc_14'] > 50).astype(np.int8)   # volume up > 50%
+
+    # -----------------------------------------------------------------------
     # SESSION TIME FLAGS  (prefix: ses_)
     # Useful for enforcing the 10 AM entry and 4 PM exit rules in backtesting.
     # -----------------------------------------------------------------------
@@ -374,21 +746,41 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         'localSymbol', 'conId', 'fnd_trade_date', 'chp_regime'
     }
 
+    # Columns that are already int8 flags — do not cast to float32
+    int8_flag_cols = {
+        'ses_after_10', 'ses_before_345', 'ses_minute',
+        'ema_crossover', 'ema_cross_event',
+        'mcd_hist_growing', 'mcd_cross_event', 'mcd_sig_event',
+        'adx_rising', 'adx_trend_gate',
+        'rsi_cross_50', 'rsi_cross_30', 'rsi_oversold', 'rsi_overbought',
+        'sto_cross_up', 'sto_oversold', 'sto_overbought',
+        'cci_cross_0', 'cci_cross_m100', 'cci_oversold', 'cci_overbought',
+        'atr_spike',
+        'bbd_squeeze', 'bbd_expanding', 'bbd_above_sma',
+        'chp_trending', 'chp_ranging',
+        'vwp_above', 'vwp_cross_up',
+        'obv_above_ema', 'obv_rising', 'obv_div_bear',
+        'mfi_cross_50', 'mfi_oversold', 'mfi_bounce',
+        # New indicator flags
+        'sar_bull', 'sar_flip_bull',
+        'don_breakout_up', 'don_bull',
+        'arn_bull', 'arn_cross_up',
+        'vtx_bull', 'vtx_cross_up',
+        'cmo_bull', 'cmo_cross_0',
+        'tsi_bull', 'tsi_cross_0', 'tsi_cross_sig',
+        'roc_bull', 'roc_cross_0',
+        'frc_bull', 'frc_cross_0',
+        'srsi_cross_up', 'srsi_oversold', 'srsi_overbought',
+        'rmi_cross_50', 'rmi_oversold', 'rmi_overbought',
+        'klg_bull', 'klg_cross_sig',
+        'vrc_pos', 'vrc_spike',
+    }
+
     float_cols = [
         c for c in df.columns
-        if c not in raw_cols and df[c].dtype in [np.float64, np.int64, np.int8]
-        and c not in ['ses_after_10', 'ses_before_345', 'ses_minute',
-                      'ema_crossover', 'ema_cross_event',
-                      'mcd_hist_growing', 'mcd_cross_event', 'mcd_sig_event',
-                      'adx_rising', 'adx_trend_gate',
-                      'rsi_cross_50', 'rsi_cross_30', 'rsi_oversold', 'rsi_overbought',
-                      'sto_cross_up', 'sto_oversold', 'sto_overbought',
-                      'cci_cross_0', 'cci_cross_m100', 'cci_oversold', 'cci_overbought',
-                      'atr_spike', 'bbd_squeeze', 'bbd_expanding', 'bbd_above_sma',
-                      'chp_trending', 'chp_ranging',
-                      'vwp_above', 'vwp_cross_up',
-                      'obv_above_ema', 'obv_rising', 'obv_div_bear',
-                      'mfi_cross_50', 'mfi_oversold', 'mfi_bounce']
+        if c not in raw_cols
+        and c not in int8_flag_cols
+        and df[c].dtype in [np.float64, np.int64]
     ]
     for col in float_cols:
         try:
@@ -405,7 +797,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 SCHEMA = """
 Index,Column Name,Prefix,Description
---- RAW COLUMNS (from sq-AAPL.csv) ---
+--- RAW COLUMNS (from sq_AAPL.csv) ---
 1,date,,Quote datetime -- unique, sorted ascending
 2,vix,,CBOE Implied Volatility Index at bar time
 3,open,,First traded price of the bar
@@ -430,7 +822,7 @@ Index,Column Name,Prefix,Description
 20,fnd_prev_close,fnd_,close.shift(1) -- prior bar close
 21,fnd_close_chg,fnd_,close - prev_close -- bar price change
 22,fnd_abs_chg,fnd_,abs(close_change) -- absolute price change
-23,fnd_true_range,fnd_,max(H-L, |H-prevC|, |L-prevC|) -- shared by ATR/ADX/Choppiness
+23,fnd_true_range,fnd_,max(H-L |H-prevC| |L-prevC|) -- shared by ATR/ADX/Choppiness
 24,fnd_high_14,fnd_,Rolling 14-bar highest high -- shared by Stochastic/Choppiness
 25,fnd_low_14,fnd_,Rolling 14-bar lowest low -- shared by Stochastic/Choppiness
 26,fnd_trade_date,fnd_,Date-only portion of datetime -- used to reset VWAP each session
@@ -511,7 +903,7 @@ Index,Column Name,Prefix,Description
 83,chp_14,chp_,Choppiness Index (14-period) -- scale 1-100
 84,chp_trending,chp_,1 if chp_14 < 38.2 (clearly trending) else 0
 85,chp_ranging,chp_,1 if chp_14 > 61.8 (clearly choppy) else 0
-86,chp_regime,chp_,String label: 'trend' / 'range' / 'neutral'
+86,chp_regime,chp_,String label: trend / range / neutral
 
 --- VWAP columns (vwp_) ---
 87,vwp_pv,vwp_,Price x Volume -- cumulative numerator for VWAP
@@ -541,6 +933,81 @@ Index,Column Name,Prefix,Description
 105,ses_after_10,ses_,1 if bar is at or after 10:00 AM (valid entry window) else 0
 106,ses_before_345,ses_,1 if bar is before 3:45 PM (safe new-entry window) else 0
 107,ses_minute,ses_,Minutes since midnight (hour*60 + minute) -- for time-based rules
+
+--- PARABOLIC SAR columns (sar_) ---
+108,sar_value,sar_,SAR price level for the current bar
+109,sar_bull,sar_,1 if price > SAR (uptrend) else 0 (downtrend)
+110,sar_flip_bull,sar_,1 on bar where SAR flips from bearish to bullish (entry signal) else 0
+
+--- DONCHIAN CHANNELS columns (don_) ---
+111,don_upper_20,don_,20-period rolling highest high
+112,don_lower_20,don_,20-period rolling lowest low
+113,don_mid_20,don_,(don_upper_20 + don_lower_20) / 2 -- channel midpoint
+114,don_width,don_,don_upper_20 - don_lower_20 -- channel width
+115,don_breakout_up,don_,1 if close > prior bar don_upper_20 (breakout signal) else 0
+116,don_bull,don_,1 if close > don_mid_20 else 0
+
+--- AROON columns (arn_) ---
+117,arn_up,arn_,Aroon Up (0-100) -- 100 x (25 - bars since 25-period high) / 25
+118,arn_dn,arn_,Aroon Down (0-100) -- 100 x (25 - bars since 25-period low) / 25
+119,arn_osc,arn_,Aroon Oscillator = arn_up - arn_dn (-100 to +100)
+120,arn_bull,arn_,1 if arn_up > 70 AND arn_dn < 30 (strong uptrend) else 0
+121,arn_cross_up,arn_,1 on bar where Aroon Up crosses above Aroon Down else 0
+
+--- VORTEX columns (vtx_) ---
+122,vtx_plus,vtx_,VI+ = sum(|high - prev_low|) / sum(true_range) over 14 bars
+123,vtx_minus,vtx_,VI- = sum(|low - prev_high|) / sum(true_range) over 14 bars
+124,vtx_bull,vtx_,1 if vtx_plus > vtx_minus else 0
+125,vtx_cross_up,vtx_,1 on bar where VI+ crosses above VI- else 0
+
+--- CHANDE MOMENTUM OSCILLATOR columns (cmo_) ---
+126,cmo_14,cmo_,CMO value (-100 to +100) -- 14-period
+127,cmo_bull,cmo_,1 if cmo_14 > 0 else 0
+128,cmo_cross_0,cmo_,1 on bar where CMO crosses above 0 from below else 0
+
+--- TRUE STRENGTH INDEX columns (tsi_) ---
+129,tsi_val,tsi_,TSI value -- double-smoothed momentum (EMA25 of EMA13)
+130,tsi_signal,tsi_,TSI signal line = 13-period EMA of tsi_val
+131,tsi_bull,tsi_,1 if tsi_val > 0 else 0
+132,tsi_cross_0,tsi_,1 on bar where TSI crosses above 0 from below else 0
+133,tsi_cross_sig,tsi_,1 on bar where TSI crosses above signal line else 0
+
+--- RATE OF CHANGE columns (roc_) ---
+134,roc_12,roc_,ROC = ((close - close[12]) / close[12]) * 100 -- 12-period
+135,roc_bull,roc_,1 if roc_12 > 0 else 0
+136,roc_cross_0,roc_,1 on bar where ROC crosses above 0 from below else 0
+
+--- FORCE INDEX columns (frc_) ---
+137,frc_raw,frc_,Raw Force Index = close_change x volume
+138,frc_ema_2,frc_,2-period EMA of frc_raw (fast)
+139,frc_ema_13,frc_,13-period EMA of frc_raw (main signal)
+140,frc_bull,frc_,1 if frc_ema_13 > 0 else 0
+141,frc_cross_0,frc_,1 on bar where frc_ema_13 crosses above 0 else 0
+
+--- STOCHASTIC RSI columns (srsi_) ---
+142,srsi_k,srsi_,Stochastic %K applied to RSI values (0-100)
+143,srsi_d,srsi_,3-period SMA of srsi_k (signal line)
+144,srsi_cross_up,srsi_,1 on bar where srsi_k crosses above srsi_d else 0
+145,srsi_oversold,srsi_,1 if srsi_k < 20 else 0
+146,srsi_overbought,srsi_,1 if srsi_k > 80 else 0
+
+--- RELATIVE MOMENTUM INDEX columns (rmi_) ---
+147,rmi_14,rmi_,RMI value (0-100) -- RSI using 3-bar momentum over 14-period
+148,rmi_cross_50,rmi_,1 on bar where RMI crosses above 50 from below else 0
+149,rmi_oversold,rmi_,1 if rmi_14 < 30 else 0
+150,rmi_overbought,rmi_,1 if rmi_14 > 70 else 0
+
+--- KLINGER VOLUME OSCILLATOR columns (klg_) ---
+151,klg_vf,klg_,Volume Force -- raw KVO input
+152,klg_line,klg_,KVO line = EMA(34) - EMA(55) of volume force
+153,klg_signal,klg_,KVO signal line = 13-period EMA of klg_line
+154,klg_bull,klg_,1 if klg_line > klg_signal else 0
+155,klg_cross_sig,klg_,1 on bar where KVO crosses above signal line else 0
+
+--- VOLUME RATE OF CHANGE columns (vrc_) ---
+156,vrc_14,vrc_,Volume ROC = ((volume - volume[14]) / volume[14]) * 100
+157,vrc_pos,vrc_,1 if vrc_14 > 0 (volume expanding vs 14 bars ago) else 0
+158,vrc_spike,vrc_,1 if vrc_14 > 50 (volume up more than 50%) else 0
 """
 
 
@@ -566,14 +1033,21 @@ if __name__ == '__main__':
     print(f"  Done. {len(dfExtended.columns)} columns, {len(dfExtended):,} rows.")
 
     print(f"Writing {schema_path} ...")
+    schema_path.parent.mkdir(parents=True, exist_ok=True)
     schema_path.write_text(SCHEMA.strip())
     print("  Done.")
 
-    # Quick sanity check — print non-null counts for key indicator columns
+    # Sanity check — non-null counts for all 25 indicator families
     check_cols = [
+        # Original 13
         'ema_9', 'mcd_histogram', 'adx_14', 'rsi_14',
         'sto_k', 'cci_20', 'atr_14', 'bbd_width',
-        'chp_14', 'vwp_vwap', 'obv_raw', 'mfi_14'
+        'chp_14', 'vwp_vwap', 'obv_raw', 'mfi_14',
+        # New 13
+        'sar_value', 'don_upper_20', 'arn_up',
+        'vtx_plus', 'cmo_14', 'tsi_val',
+        'roc_12', 'frc_ema_13', 'srsi_k',
+        'rmi_14', 'klg_line', 'vrc_14',
     ]
     print("\nSanity check — non-null counts per indicator:")
     for col in check_cols:
