@@ -1,0 +1,137 @@
+Index,Column Name,Prefix,Description
+--- RAW COLUMNS (from sq-AAPL.csv) ---
+1,date,,Quote datetime -- unique, sorted ascending
+2,vix,,CBOE Implied Volatility Index at bar time
+3,open,,First traded price of the bar
+4,high,,Highest traded price of the bar
+5,low,,Lowest traded price of the bar
+6,close,,Last traded price of the bar
+7,avg_bid,,Time-averaged bid price over the bar
+8,avg_ask,,Time-averaged ask price over the bar
+9,max_ask,,Maximum ask price observed in the bar
+10,min_bid,,Minimum bid price observed in the bar
+11,average,,Volume-weighted average price (WAP) from IB
+12,barCount,,Number of individual trades in the bar
+13,volume,,Total share volume in the bar
+14,symbol,,Stock symbol (AAPL)
+15,localSymbol,,Option symbol if applicable
+16,conId,,Interactive Brokers contract ID
+
+--- FOUNDATION columns (fnd_) ---
+17,fnd_typical_price,fnd_,(high + low + close) / 3 -- shared by VWAP / CCI / MFI
+18,fnd_hl2,fnd_,(high + low) / 2 -- bar midpoint
+19,fnd_price_range,fnd_,high - low -- raw bar range
+20,fnd_prev_close,fnd_,close.shift(1) -- prior bar close
+21,fnd_close_chg,fnd_,close - prev_close -- bar price change
+22,fnd_abs_chg,fnd_,abs(close_change) -- absolute price change
+23,fnd_true_range,fnd_,max(H-L, |H-prevC|, |L-prevC|) -- shared by ATR/ADX/Choppiness
+24,fnd_high_14,fnd_,Rolling 14-bar highest high -- shared by Stochastic/Choppiness
+25,fnd_low_14,fnd_,Rolling 14-bar lowest low -- shared by Stochastic/Choppiness
+26,fnd_trade_date,fnd_,Date-only portion of datetime -- used to reset VWAP each session
+
+--- EMA CROSSOVER columns (ema_) ---
+27,ema_9,ema_,9-period EMA of close
+28,ema_12,ema_,12-period EMA of close (shared with MACD)
+29,ema_21,ema_,21-period EMA of close
+30,ema_26,ema_,26-period EMA of close (shared with MACD)
+31,ema_crossover,ema_,1 if ema_9 > ema_21 (bullish state) else 0
+32,ema_cross_event,ema_,+1 on bullish cross -1 on bearish cross 0 otherwise
+
+--- MACD columns (mcd_) ---
+33,mcd_line,mcd_,MACD line = ema_12 - ema_26
+34,mcd_signal,mcd_,Signal line = 9-period EMA of mcd_line
+35,mcd_histogram,mcd_,mcd_line - mcd_signal
+36,mcd_hist_prev,mcd_,Prior bar histogram value
+37,mcd_hist_growing,mcd_,1 if histogram growing bar-over-bar else 0
+38,mcd_cross_event,mcd_,+1 histogram crosses above zero -1 crosses below 0 otherwise
+39,mcd_sig_event,mcd_,+1 MACD line crosses above signal line -1 crosses below
+
+--- ADX / DMI columns (adx_) ---
+40,adx_plus_di,adx_,+DI directional indicator (14-period Wilder smooth)
+41,adx_minus_di,adx_,-DI directional indicator (14-period Wilder smooth)
+42,adx_14,adx_,Average Directional Index (14-period)
+43,adx_rising,adx_,1 if ADX rising versus prior bar else 0
+44,adx_trend_gate,adx_,1 if ADX > 25 AND +DI > -DI (strong bullish trend) else 0
+
+--- ATR columns (atr_) ---
+45,atr_14,atr_,14-period Wilder smoothed Average True Range (also used by ADX)
+46,atr_20_avg,atr_,20-bar rolling average of atr_14
+47,atr_spike,atr_,1 if atr_14 > 2x atr_20_avg (volatility spike suppressor) else 0
+48,atr_bar_ratio,atr_,price_range / atr_14 -- bar strength relative to ATR
+49,atr_stop_1x,atr_,1.0 x atr_14 -- tight stop distance
+50,atr_stop_15x,atr_,1.5 x atr_14 -- baseline stop distance
+51,atr_stop_2x,atr_,2.0 x atr_14 -- wide stop distance
+52,atr_tgt_15rr,atr_,1.5 RR profit target based on 1.5x ATR stop
+53,atr_tgt_2rr,atr_,2.0 RR profit target based on 1.5x ATR stop
+
+--- RSI columns (rsi_) ---
+54,rsi_avg_gain,rsi_,14-period Wilder smoothed average gain
+55,rsi_avg_loss,rsi_,14-period Wilder smoothed average loss
+56,rsi_rs,rsi_,avg_gain / avg_loss ratio
+57,rsi_14,rsi_,RSI value (0-100)
+58,rsi_cross_50,rsi_,1 on bar where RSI crosses above 50 from below else 0
+59,rsi_cross_30,rsi_,1 on bar where RSI crosses above 30 from below (oversold bounce) else 0
+60,rsi_oversold,rsi_,1 if rsi_14 < 30 else 0
+61,rsi_overbought,rsi_,1 if rsi_14 > 70 else 0
+
+--- STOCHASTIC columns (sto_) ---
+62,sto_k,sto_,%K stochastic value (0-100)
+63,sto_d,sto_,%D signal line = 3-period SMA of sto_k
+64,sto_cross_up,sto_,1 on bar where %K crosses above %D else 0
+65,sto_oversold,sto_,1 if sto_k < 20 else 0
+66,sto_overbought,sto_,1 if sto_k > 80 else 0
+
+--- CCI columns (cci_) ---
+67,cci_sma_tp,cci_,20-period SMA of typical price
+68,cci_mean_dev,cci_,20-period mean absolute deviation of typical price
+69,cci_20,cci_,CCI value (unbounded oscillator)
+70,cci_cross_0,cci_,1 on bar where CCI crosses above 0 from below else 0
+71,cci_cross_m100,cci_,1 on bar where CCI crosses above -100 from below (oversold exit) else 0
+72,cci_oversold,cci_,1 if cci_20 < -100 else 0
+73,cci_overbought,cci_,1 if cci_20 > 100 else 0
+
+--- BOLLINGER BANDS / WIDTH columns (bbd_) ---
+74,bbd_sma_20,bbd_,20-period SMA of close (Bollinger center line)
+75,bbd_std_20,bbd_,20-period rolling standard deviation of close
+76,bbd_upper,bbd_,Upper Bollinger Band = sma_20 + 2 x std_20
+77,bbd_lower,bbd_,Lower Bollinger Band = sma_20 - 2 x std_20
+78,bbd_width,bbd_,(upper - lower) / sma_20 -- normalized band width
+79,bbd_squeeze,bbd_,1 if bbd_width <= 1.1 x 20-bar min width (squeeze condition) else 0
+80,bbd_expanding,bbd_,1 if bbd_width wider than prior bar else 0
+81,bbd_pct_b,bbd_,%B = (close - lower) / (upper - lower) -- price position within bands
+82,bbd_above_sma,bbd_,1 if close > bbd_sma_20 else 0
+
+--- CHOPPINESS INDEX columns (chp_) ---
+83,chp_14,chp_,Choppiness Index (14-period) -- scale 1-100
+84,chp_trending,chp_,1 if chp_14 < 38.2 (clearly trending) else 0
+85,chp_ranging,chp_,1 if chp_14 > 61.8 (clearly choppy) else 0
+86,chp_regime,chp_,String label: 'trend' / 'range' / 'neutral'
+
+--- VWAP columns (vwp_) ---
+87,vwp_pv,vwp_,Price x Volume -- cumulative numerator for VWAP
+88,vwp_vwap,vwp_,Intraday VWAP -- resets at start of each trading session
+89,vwp_vwap_upper,vwp_,Approximate upper VWAP band (vwap + bbd_std_20)
+90,vwp_vwap_lower,vwp_,Approximate lower VWAP band (vwap - bbd_std_20)
+91,vwp_above,vwp_,1 if close > vwap else 0
+92,vwp_cross_up,vwp_,1 on bar where price crosses above VWAP else 0
+93,vwp_distance,vwp_,% distance of close from VWAP ((close-vwap)/vwap*100)
+
+--- OBV columns (obv_) ---
+94,obv_raw,obv_,Cumulative On Balance Volume
+95,obv_ema_20,obv_,20-period EMA of obv_raw (OBV trend line)
+96,obv_above_ema,obv_,1 if obv_raw > obv_ema_20 (OBV in uptrend) else 0
+97,obv_rising,obv_,1 if obv_raw > obv_raw 3 bars ago else 0
+98,obv_div_bear,obv_,1 if price higher but OBV lower over last 3 bars (bearish divergence) else 0
+
+--- MFI columns (mfi_) ---
+99,mfi_pos_flow,mfi_,14-period sum of positive money flow
+100,mfi_neg_flow,mfi_,14-period sum of negative money flow
+101,mfi_14,mfi_,Money Flow Index value (0-100)
+102,mfi_cross_50,mfi_,1 on bar where MFI crosses above 50 from below else 0
+103,mfi_oversold,mfi_,1 if mfi_14 < 20 else 0
+104,mfi_bounce,mfi_,1 on bar where MFI crosses above 30 from below (oversold bounce) else 0
+
+--- SESSION TIME FLAGS (ses_) ---
+105,ses_after_10,ses_,1 if bar is at or after 10:00 AM (valid entry window) else 0
+106,ses_before_345,ses_,1 if bar is before 3:45 PM (safe new-entry window) else 0
+107,ses_minute,ses_,Minutes since midnight (hour*60 + minute) -- for time-based rules

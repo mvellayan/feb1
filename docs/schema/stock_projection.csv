@@ -1,0 +1,17 @@
+Index,Column Name,Description
+1,date,Quote datetime -- unique sorted ascending
+2,vix,CBOE Implied Volatility Index at bar time
+3,open,First traded price of the bar
+4,high,Highest traded price of the bar
+5,low,Lowest traded price of the bar
+6,close,Last traded price of the bar
+7,avg_bid,Time-averaged bid price over the bar (renamed from open in BID_ASK)
+8,avg_ask,Time-averaged ask price over the bar (renamed from close in BID_ASK)
+9,max_ask,Maximum ask price observed in the bar (renamed from high in BID_ASK)
+10,min_bid,Minimum bid price observed in the bar (renamed from low in BID_ASK)
+11,average,Volume-weighted average price (WAP) from IB
+12,barCount,Number of individual trades in the bar
+13,volume,Total share volume in the bar
+14,symbol,Stock symbol (AAPL)
+15,localSymbol,Local symbol as reported by IB
+16,conId,Interactive Brokers contract ID
