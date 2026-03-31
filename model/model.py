@@ -21,9 +21,8 @@ Pipeline
 
 5.  Position     : $10,000 per trade, floor(10000/entry_price) shares, $2 commission.
 
-6.  Output       : ../reports/model_summary_DDMMHHMMSS.md
-                   ../reports/model_detailed_DDMMHHMMSS.md
-                   ../reports/trades_DDMMHHMMSS.csv
+6.  Output       : ../reports/{batch_no}_summary.csv
+                   ../reports/{batch_no}_trades.csv
 """
 
 from __future__ import annotations
@@ -66,6 +65,8 @@ EXIT_MINUTE   = 15 * 60 + 45      # 3:45 PM in minutes-since-midnight
 
 TOP_N_DETAIL  = 20                # models shown in the detailed report
 
+BATCH_FILE    = Path('batch.txt')  # tracks batch number across runs
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Indicator categories
 # ──────────────────────────────────────────────────────────────────────────────
@@ -76,19 +77,42 @@ VOLUME     = ['vwap', 'obv', 'mfi', 'klg', 'frc', 'vrc']
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BATCH COUNTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def read_increment_batch() -> int:
+    """
+    Reads batch.txt (creates it at 0 if missing), increments by 1,
+    writes the new value back, and returns it.
+    """
+    val = int(BATCH_FILE.read_text().strip()) if BATCH_FILE.exists() else 0
+    batch_no = val + 1
+    BATCH_FILE.write_text(str(batch_no))
+    return batch_no
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 -- SIGNALS CSV  (load or build)
 # ══════════════════════════════════════════════════════════════════════════════
+
+_signals_cache: pd.DataFrame | None = None
+
 
 def load_or_build_signals() -> pd.DataFrame:
     """
     Returns the signals DataFrame.
-    If sq_AAPL_signals.csv exists, read it directly.
-    Otherwise, build from sq_AAPL_extended.csv and save.
+    Cached in memory after the first load — subsequent calls return instantly.
     """
+    global _signals_cache
+    if _signals_cache is not None:
+        print("[signals] Using in-memory cache.")
+        return _signals_cache
+
     if SIGNALS_CSV.exists():
         print(f"[signals] Loading cached {SIGNALS_CSV} ...")
         df = pd.read_csv(SIGNALS_CSV, parse_dates=['date'], low_memory=False)
         print(f"  Loaded  : {df.shape[0]:,} rows x {df.shape[1]} columns")
+        _signals_cache = df
         return df
 
     print(f"[signals] {SIGNALS_CSV} not found -- building from {EXTENDED_CSV} ...")
@@ -109,6 +133,7 @@ def load_or_build_signals() -> pd.DataFrame:
     SIGNALS_CSV.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(SIGNALS_CSV, index=False)
     print(f"  Saved   : {SIGNALS_CSV}  ({df.shape[1]} columns)")
+    _signals_cache = df
     return df
 
 
@@ -200,6 +225,7 @@ def simulate_trade(
     """
     exit_price  = None
     exit_reason = None
+    exit_bar    = None
     bars_held   = 0
 
     for i in range(entry_iloc + 1, len(df_day)):
@@ -210,18 +236,21 @@ def simulate_trade(
         if int(bar['ses_minute']) >= EXIT_MINUTE:
             exit_price  = float(bar['close'])
             exit_reason = 'time_box'
+            exit_bar    = bar
             break
 
         # 2. Stop-loss
         if float(bar['low']) <= stop:
             exit_price  = stop
             exit_reason = 'stop_loss'
+            exit_bar    = bar
             break
 
         # 3. Profit target
         if float(bar['high']) >= target:
             exit_price  = target
             exit_reason = 'profit_target'
+            exit_bar    = bar
             break
 
         # 4. Sell signals from this model's 4 indicators
@@ -229,15 +258,19 @@ def simulate_trade(
             if int(bar.get(sc, 0)):
                 exit_price  = float(bar['close'])
                 exit_reason = f'sell_{sc[5:]}'   # strip 'ssig_' prefix
+                exit_bar    = bar
                 break
         if exit_price is not None:
             break
 
     # Safety net -- no exit found before end of day data
     if exit_price is None:
-        last = df_day.iloc[-1]
+        last        = df_day.iloc[-1]
         exit_price  = float(last['close'])
         exit_reason = 'eod_forced'
+        exit_bar    = last
+
+    exit_time = str(exit_bar['date']) if exit_bar is not None else ''
 
     cost       = shares * entry_price
     proceeds   = shares * exit_price
@@ -246,6 +279,7 @@ def simulate_trade(
 
     return {
         'exit_price':    round(exit_price, 4),
+        'exit_time':     exit_time,
         'exit_reason':   exit_reason,
         'bars_held':     bars_held,
         'shares':        shares,
@@ -266,6 +300,7 @@ def run_all_models(
     sample_idx:  list,
     day_dict:    dict,
     day_pos_map: dict,
+    batch_no:    int,
 ):
     """
     Iterates over all 1,221 valid combinations.
@@ -278,8 +313,8 @@ def run_all_models(
     all_trades   = []
     summary_rows = []
 
-    print(f"\n[backtest] Running {n_combos:,} model combinations ...")
-    print(f"           Sample size : {len(sample_idx):,} bars")
+    print(f"\n[B{batch_no}][backtest] Running {n_combos:,} model combinations ...")
+    print(f"[B{batch_no}]           Sample size : {len(sample_idx):,} bars")
 
     for model_id, (t, m, v, vol) in enumerate(combos, 1):
 
@@ -296,6 +331,7 @@ def run_all_models(
         fired_idx = sample_df.index[composite].tolist()
 
         model_trades = []
+        trade_no     = 0
 
         for idx in fired_idx:
             row         = df.loc[idx]
@@ -321,12 +357,15 @@ def run_all_models(
                 sell_cols, entry_price, shares
             )
 
+            trade_no += 1
             rsi_val  = row.get('rsi_14', np.nan)
             adx_val  = row.get('adx_14', np.nan)
             vwap_val = row.get('vwp_vwap', np.nan)
 
             trade_record = {
-                'model_id':      model_id,
+                'batch_no':      batch_no,
+                'model_no':      model_id,
+                'trade_no':      trade_no,
                 'trend':         t,
                 'momentum':      m,
                 'volatility':    v,
@@ -350,6 +389,7 @@ def run_all_models(
 
         if n_trades == 0:
             summary_rows.append({
+                'batch_no': batch_no,
                 'model_id': model_id,
                 'trend': t, 'momentum': m,
                 'volatility': v, 'volume': vol,
@@ -382,6 +422,7 @@ def run_all_models(
         )
 
         summary_rows.append({
+            'batch_no':          batch_no,
             'model_id':          model_id,
             'trend':             t,
             'momentum':          m,
@@ -402,223 +443,74 @@ def run_all_models(
         # -- Progress every 100 models ----------------------------------------
         if model_id % 100 == 0 or model_id == n_combos:
             print(
-                f"  [{model_id:>5}/{n_combos}]  "
+                f"  [B{batch_no}|M{model_id:>5}/{n_combos}]  "
                 f"trades so far: {len(all_trades):,}"
             )
 
-    print(f"\n[backtest] Complete.  Total trades: {len(all_trades):,}")
+    print(f"\n[B{batch_no}][backtest] Complete.  Total trades: {len(all_trades):,}")
     return pd.DataFrame(summary_rows), pd.DataFrame(all_trades)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 6 -- REPORTS
+# STEP 6 -- REPORTS (CSV)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _md_table(df: pd.DataFrame, float_fmt: str = '.2f') -> str:
-    """Convert a DataFrame to a GitHub-flavoured Markdown table string."""
-    lines  = []
-    header = '| ' + ' | '.join(str(c) for c in df.columns) + ' |'
-    sep    = '| ' + ' | '.join(['---'] * len(df.columns)) + ' |'
-    lines.append(header)
-    lines.append(sep)
-    for _, row in df.iterrows():
-        cells = []
-        for v in row.values:
-            if isinstance(v, float):
-                cells.append(f'{v:{float_fmt}}')
-            else:
-                cells.append(str(v))
-        lines.append('| ' + ' | '.join(cells) + ' |')
-    return '\n'.join(lines)
-
-
-def write_summary_report(
-    summary_df:     pd.DataFrame,
-    iteration: int,
-    timestamp:      str,
-    n_valid_models: int,
-    n_total_trades: int,
+def write_summary_csv(
+    summary_df: pd.DataFrame,
+    batch_no:   int,
 ) -> Path:
     """
-    Writes model_summary_TIMESTAMP.md.
-    Sections: config, aggregate stats, top-50 by Sharpe, top-50 by P&L,
-              bottom-20, full ranked table.
+    Writes {batch_no}_summary.csv — one row per model with aggregated stats.
+    Columns: batch_no, model_id, trend, momentum, volatility, volume,
+             number_of_trades, win_rate, avg_entry_price, avg_exit_price,
+             avg_stop_loss, avg_profit_target, avg_atr_at_entry,
+             avg_rsi_at_entry, avg_adx_at_entry, avg_vwap_at_entry,
+             avg_bars_held, avg_shares, total_cost, total_proceeds,
+             total_pnl, avg_pnl, avg_pnl_pct, top_exit_reason,
+             profit_factor, sharpe, max_drawdown
     """
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = REPORTS_DIR / f'{timestamp}_{iteration}_model_summary.md'
+    path = REPORTS_DIR / f'{batch_no}_summary.csv'
 
-    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    sdf = summary_df.copy()
-    sdf_active = sdf[sdf['trades'] > 0].copy()
+    out = summary_df[summary_df['trades'] > 0].rename(columns={
+        'trades':            'number_of_trades',
+        'avg_entry':         'avg_entry_price',
+        'avg_exit':          'avg_exit_price',
+        'avg_duration_bars': 'avg_bars_held',
+        'total_pnl':         'total_pnl',
+        'avg_pnl':           'avg_pnl',
+    })
 
-    lines = []
-    lines.append('# AAPL Intraday Backtest -- Model Summary')
-    lines.append(f'\n_Generated: {now}_\n')
-
-    # Config block
-    lines.append('## Configuration\n')
-    lines.append('| Parameter | Value |')
-    lines.append('|---|---|')
-    for k, v in [
-        ('Date Range',         f'{DATE_START} to {DATE_END}'),
-        ('Entry Window',       'After 10:00 AM'),
-        ('Exit Time-Box',      '3:45 PM'),
-        ('Sample Size',        f'{N_SAMPLE:,} fixed bars (seed={RANDOM_SEED})'),
-        ('Trade Capital',      f'${TRADE_CAPITAL:,.0f}'),
-        ('Commission',         f'${COMMISSION:.2f} round-trip'),
-        ('ATR Stop Mult',      f'{ATR_STOP_MULT}x'),
-        ('Reward:Risk',        f'{ATR_TARGET_RR}:1'),
-        ('Total Combinations', '1,260'),
-        ('Valid Models',       f'{n_valid_models:,}'),
-        ('Models with Trades', f'{len(sdf_active):,}'),
-        ('Total Trades',       f'{n_total_trades:,}'),
-    ]:
-        lines.append(f'| {k} | {v} |')
-    lines.append('')
-
-    # Aggregate stats
-    if not sdf_active.empty:
-        lines.append('## Aggregate Performance (all active models)\n')
-        lines.append('| Metric | Value |')
-        lines.append('|---|---|')
-        total_pnl = sdf_active['total_pnl'].sum()
-        avg_wr    = sdf_active['win_rate'].mean()
-        finite_pf = sdf_active.loc[sdf_active['profit_factor'] < 1e9, 'profit_factor']
-        avg_pf    = finite_pf.mean() if len(finite_pf) > 0 else 0.0
-        avg_sh    = sdf_active['sharpe'].mean()
-        lines.append(f'| Combined P&L across all models | ${total_pnl:,.2f} |')
-        lines.append(f'| Average Win Rate               | {avg_wr:.1f}% |')
-        lines.append(f'| Average Profit Factor          | {avg_pf:.3f} |')
-        lines.append(f'| Average Sharpe                 | {avg_sh:.3f} |')
-        lines.append('')
-
-    display_cols = [
-        'model_id', 'trend', 'momentum', 'volatility', 'volume',
-        'trades', 'win_rate', 'avg_entry', 'avg_exit',
-        'avg_duration_bars', 'total_pnl', 'profit_factor', 'sharpe'
-    ]
-
-    def _rank_section(df_sub, title, n=50):
-        lines.append(f'## {title}\n')
-        sub = df_sub.head(n)[display_cols].copy()
-        sub.insert(0, 'rank', range(1, len(sub) + 1))
-        lines.append(_md_table(sub))
-        lines.append('')
-
-    if not sdf_active.empty:
-        _rank_section(
-            sdf_active.sort_values('sharpe', ascending=False),
-            'Top 10 Models -- Ranked by Sharpe', 10
-        )
-        _rank_section(
-            sdf_active.sort_values('total_pnl', ascending=False),
-            'Top 10 Models -- Ranked by Total P&L ($)', 10
-        )
-        _rank_section(
-            sdf_active.sort_values('total_pnl', ascending=True),
-            'Bottom 10 Models -- Worst Total P&L', 10
-        )
-
-    # Full table
-    lines.append('## Full Model Table (all 1,221 combinations)\n')
-    all_display = [
-        'model_id', 'trend', 'momentum', 'volatility', 'volume',
-        'trades', 'win_rate', 'total_pnl', 'profit_factor', 'sharpe', 'max_drawdown'
-    ]
-    lines.append(_md_table(
-        sdf.sort_values('total_pnl', ascending=False)[all_display]
-    ))
-    lines.append('')
-
-    path.write_text('\n'.join(lines), encoding='utf-8')
-    print(f"[report]  Summary  -> {path}")
+    out.to_csv(path, index=False)
+    print(f"[B{batch_no}][report]  Summary  -> {path}  ({len(out):,} rows)")
     return path
 
 
-def write_detailed_report(
-    trades_df:  pd.DataFrame,
-    summary_df: pd.DataFrame,
-    timestamp:  str,
+def write_trades_csv(
+    trades_df: pd.DataFrame,
+    batch_no:  int,
 ) -> Path:
     """
-    Writes model_detailed_TIMESTAMP.md.
-    Trade-by-trade breakdown for the top TOP_N_DETAIL models by total P&L.
+    Writes {batch_no}_trades.csv — one row per executed trade.
+    Key columns: batch_no, model_no, trade_no, plus all entry/exit/performance fields.
     """
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = REPORTS_DIR / f'model_detailed_{timestamp}.md'
+    path = REPORTS_DIR / f'{batch_no}_trades.csv'
 
-    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    lines = []
-    lines.append('# AAPL Intraday Backtest -- Detailed Trade Report')
-    lines.append(
-        f'\n_Generated: {now} | '
-        f'Showing top {TOP_N_DETAIL} models by Total P&L_\n'
-    )
-
-    if trades_df.empty or summary_df.empty:
-        lines.append('_No trades were executed._')
-        path.write_text('\n'.join(lines), encoding='utf-8')
-        return path
-
-    sdf_active = summary_df[summary_df['trades'] > 0]
-    top_ids = (
-        sdf_active
-        .sort_values('total_pnl', ascending=False)
-        .head(TOP_N_DETAIL)['model_id']
-        .tolist()
-    )
-
-    for rank, mid in enumerate(top_ids, 1):
-        model_row    = summary_df[summary_df['model_id'] == mid].iloc[0]
-        model_trades = trades_df[trades_df['model_id'] == mid].copy()
-
-        t   = model_row['trend']
-        m   = model_row['momentum']
-        v   = model_row['volatility']
-        vol = model_row['volume']
-
-        lines.append('---\n')
-        lines.append(
-            f'## Rank {rank} -- Model {mid}: '
-            f'{t.upper()} + {m.upper()} + {v.upper()} + {vol.upper()}\n'
-        )
-        lines.append('| Metric | Value |')
-        lines.append('|---|---|')
-
-        exit_counts = model_trades['exit_reason'].value_counts()
-        ec_str = '  '.join(f'{r}: {c}' for r, c in exit_counts.items())
-
-        for k, val in [
-            ('Trades',           int(model_row['trades'])),
-            ('Win Rate',         f'{model_row["win_rate"]:.1f}%'),
-            ('Avg Entry Price',  f'${model_row["avg_entry"]:.2f}'),
-            ('Avg Exit Price',   f'${model_row["avg_exit"]:.2f}'),
-            ('Avg Duration',     f'{model_row["avg_duration_bars"]:.1f} bars'),
-            ('Total P&L',        f'${model_row["total_pnl"]:,.2f}'),
-            ('Avg P&L / Trade',  f'${model_row["avg_pnl"]:,.2f}'),
-            ('Profit Factor',    f'{model_row["profit_factor"]:.3f}'),
-            ('Sharpe (annual)',  f'{model_row["sharpe"]:.3f}'),
-            ('Max Drawdown',     f'${model_row["max_drawdown"]:,.2f}'),
-            ('Exit Breakdown',   ec_str),
-        ]:
-            lines.append(f'| {k} | {val} |')
-        lines.append('')
-
-        lines.append('### Trades\n')
-        td = model_trades[[
-            'trade_date', 'entry_time', 'entry_price', 'shares',
-            'stop_loss', 'profit_target',
-            'exit_price', 'exit_reason', 'bars_held',
-            'pnl_dollar', 'pnl_pct'
-        ]].copy()
-        td['entry_time'] = pd.to_datetime(td['entry_time']).dt.strftime('%H:%M')
-        td['cum_pnl']    = td['pnl_dollar'].cumsum().round(2)
-        lines.append(_md_table(td))
-        lines.append('')
-
-    path.write_text('\n'.join(lines), encoding='utf-8')
-    print(f"[report]  Detailed -> {path}")
+    col_order = [
+        'batch_no', 'model_no', 'trade_no',
+        'trend', 'momentum', 'volatility', 'volume',
+        'trade_date', 'entry_time', 'exit_time', 'entry_price',
+        'stop_loss', 'profit_target',
+        'atr_at_entry', 'rsi_at_entry', 'adx_at_entry', 'vwap_at_entry',
+        'exit_price', 'exit_reason', 'bars_held',
+        'shares', 'cost', 'proceeds',
+        'pnl_dollar', 'pnl_pct', 'is_winner',
+    ]
+    # keep only columns that exist (guards against empty trades_df)
+    cols = [c for c in col_order if c in trades_df.columns]
+    trades_df[cols].to_csv(path, index=False)
+    print(f"[B{batch_no}][report]  Trades   -> {path}  ({len(trades_df):,} records)")
     return path
 
 
@@ -626,10 +518,11 @@ def write_detailed_report(
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_model_set(iteration):
-    ts = datetime.datetime.now().strftime('%d%m%H%M%S')
+def run_model_set(batch_no: int):
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"\n{'='*60}")
-    print(f"{iteration}:  AAPL Intraday Backtest  |  start at {ts}")
+    print(f"[B{batch_no}]  AAPL Intraday Backtest  |  start at {ts}")
+    print(f"[B{batch_no}]  Seed: {RANDOM_SEED}")
     print(f"{'='*60}\n")
 
     # 1. Load / build signals CSV
@@ -641,15 +534,15 @@ def run_model_set(iteration):
         (df['date'] <= pd.Timestamp(DATE_END))
     )
     df = df[mask].reset_index(drop=True)
-    print(f"{iteration}:[filter]  {DATE_START} -> {DATE_END}: {len(df):,} rows")
+    print(f"[B{batch_no}][filter]  {DATE_START} -> {DATE_END}: {len(df):,} rows")
     if len(df) == 0:
-        sys.exit("{iteration}:ERROR: No data in the specified date range.")
+        sys.exit(f"[B{batch_no}] ERROR: No data in the specified date range.")
 
     # 3. Fixed sample
     sample_idx = draw_sample(df)
 
     # 4. Build day-level structures once (reused across all 1,221 models)
-    print(f"{iteration}:[index]   Building day index ...")
+    print(f"[B{batch_no}][index]   Building day index ...")
     df = df.copy()
     df['_day_pos'] = df.groupby('fnd_trade_date').cumcount()
 
@@ -662,74 +555,51 @@ def run_model_set(iteration):
         for pos, global_idx in enumerate(group.index):
             day_pos_map[global_idx] = pos
 
-    print(f"{iteration}:          Trading days indexed: {len(day_dict):,}")
+    print(f"[B{batch_no}]          Trading days indexed: {len(day_dict):,}")
 
     # 5. Run all models
     summary_df, trades_df = run_all_models(
-        df, sample_idx, day_dict, day_pos_map
+        df, sample_idx, day_dict, day_pos_map, batch_no
     )
 
-    # 6. Save trades CSV
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    trades_path = REPORTS_DIR / f'trades_{ts}.csv'
-    trades_df.to_csv(trades_path, index=False)
-    print(f"{iteration}:[output]  Trades CSV -> {trades_path}  ({len(trades_df):,} records)")
+    # 6. Write CSV reports
+    write_summary_csv(summary_df, batch_no)
+    write_trades_csv(trades_df, batch_no)
 
-    # 7. Write reports
-    n_valid  = len(generate_combos())
-    n_trades = len(trades_df)
-    write_summary_report(summary_df, iteration, ts, n_valid, n_trades)
-    # write_detailed_report(trades_df, summary_df, ts)
-
-    # 8. Console summary
+    # 7. Console summary
+    n_trades   = len(trades_df)
     sdf_active = summary_df[summary_df['trades'] > 0]
     print(f"\n{'='*60}")
-    print(f"{iteration}:  RUN COMPLETE")
+    print(f"[B{batch_no}]  RUN COMPLETE")
     print(f"{'='*60}")
-    print(f"{iteration}:  Models run       : {len(summary_df):,}")
-    print(f"{iteration}:  Models w/ trades : {len(sdf_active):,}")
-    print(f"{iteration}:  Total trades     : {n_trades:,}")
+    print(f"[B{batch_no}]  Models run       : {len(summary_df):,}")
+    print(f"[B{batch_no}]  Models w/ trades : {len(sdf_active):,}")
+    print(f"[B{batch_no}]  Total trades     : {n_trades:,}")
 
     if not sdf_active.empty:
         best  = sdf_active.loc[sdf_active['total_pnl'].idxmax()]
         worst = sdf_active.loc[sdf_active['total_pnl'].idxmin()]
         print(
-            f"{iteration}:  Best  model : #{int(best['model_id'])} "
+            f"[B{batch_no}]  Best  model : [B{batch_no}|M{int(best['model_id'])}] "
             f"{best['trend'].upper()}+{best['momentum'].upper()}+"
             f"{best['volatility'].upper()}+{best['volume'].upper()} "
             f"  P&L=${best['total_pnl']:,.2f}  Sharpe={best['sharpe']:.2f}"
         )
         print(
-            f"{iteration}:  Worst model : #{int(worst['model_id'])} "
+            f"[B{batch_no}]  Worst model : [B{batch_no}|M{int(worst['model_id'])}] "
             f"{worst['trend'].upper()}+{worst['momentum'].upper()}+"
             f"{worst['volatility'].upper()}+{worst['volume'].upper()} "
             f"  P&L=${worst['total_pnl']:,.2f}  Sharpe={worst['sharpe']:.2f}"
         )
 
     print(f"{'='*60}\n")
-    return summary_df
+
 
 if __name__ == '__main__':
-    ts = datetime.datetime.now().strftime('%d%m%H%M%S')
     random_seeds = np.random.choice(10000, size=100, replace=False)
-    batch_results = []
 
-    for idx, seed in enumerate(random_seeds, 0):
+    for seed in random_seeds:
         RANDOM_SEED = int(seed)
-        result_df = run_model_set(idx)
-        batch_results.append(result_df)
-
-    batch_results_df = pd.concat(batch_results, ignore_index=True)
-
-    # Print summary
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', None)
-    print("\nBatch Results Summary:")
-    print(batch_results_df.describe())
-    print(f"\nTotal rows: {len(batch_results_df):,}")
-
-    # Save to file
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = REPORTS_DIR / f'batch_results_{ts}.csv'
-    batch_results_df.to_csv(output_path, index=False)
-    print(f"\nBatch results saved -> {output_path}")
+        batch_no = read_increment_batch()
+        print(f"[B{batch_no}]  batch.txt updated  (seed={RANDOM_SEED})")
+        run_model_set(batch_no)

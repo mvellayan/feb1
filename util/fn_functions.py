@@ -1,5 +1,8 @@
 from datetime import date, datetime, time, timedelta
 import math
+import pandas as pd
+import numpy as np
+import glob
 
 TRADING_DAYS_PER_YEAR  = 252
 TRADING_MINUTES_PER_DAY = 390          # 9:30am – 4:00pm
@@ -115,9 +118,18 @@ def calculate_sgr(purchase_date, purchase_price, sale_date, sale_price):
     period_return = sale_price / purchase_price - 1
     return period_return * (TRADING_MINUTES_PER_YEAR / trading_minutes)
 
+def combine_summaries():
+    files = glob.glob("../reports/??_summary.csv")
+    dfs = [pd.read_csv(f) for f in files]
+    combined = pd.concat(dfs, ignore_index=True)
+    combined.to_csv("../reports/summary.csv", index=False)
+    print(f"Combined {len(files)} summary files into ../reports/summary.csv")
+
+
 
 ## Unit Testing
 if __name__ == '__main__':
+    # combine_summaries()
     cases = [
         ("1 hour",   datetime(2026, 3, 16, 10, 0), datetime(2026, 3, 16, 11, 0)),
         ("2 hours",  datetime(2026, 3, 16, 10, 0), datetime(2026, 3, 16, 12, 0)),
