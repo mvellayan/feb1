@@ -434,6 +434,7 @@ def _md_table(df: pd.DataFrame, float_fmt: str = '.2f') -> str:
 
 def write_summary_report(
     summary_df:     pd.DataFrame,
+    iteration: int,
     timestamp:      str,
     n_valid_models: int,
     n_total_trades: int,
@@ -444,7 +445,7 @@ def write_summary_report(
               bottom-20, full ranked table.
     """
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = REPORTS_DIR / f'model_summary_{timestamp}.md'
+    path = REPORTS_DIR / f'{timestamp}_{iteration}_model_summary.md'
 
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     sdf = summary_df.copy()
@@ -460,7 +461,6 @@ def write_summary_report(
     lines.append('|---|---|')
     for k, v in [
         ('Date Range',         f'{DATE_START} to {DATE_END}'),
-        ('Instrument',         'AAPL -- 1-minute bars'),
         ('Entry Window',       'After 10:00 AM'),
         ('Exit Time-Box',      '3:45 PM'),
         ('Sample Size',        f'{N_SAMPLE:,} fixed bars (seed={RANDOM_SEED})'),
@@ -508,15 +508,15 @@ def write_summary_report(
     if not sdf_active.empty:
         _rank_section(
             sdf_active.sort_values('sharpe', ascending=False),
-            'Top 50 Models -- Ranked by Sharpe', 50
+            'Top 10 Models -- Ranked by Sharpe', 10
         )
         _rank_section(
             sdf_active.sort_values('total_pnl', ascending=False),
-            'Top 50 Models -- Ranked by Total P&L ($)', 50
+            'Top 10 Models -- Ranked by Total P&L ($)', 10
         )
         _rank_section(
             sdf_active.sort_values('total_pnl', ascending=True),
-            'Bottom 20 Models -- Worst Total P&L', 20
+            'Bottom 10 Models -- Worst Total P&L', 10
         )
 
     # Full table
@@ -626,10 +626,10 @@ def write_detailed_report(
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_model_set():
+def run_model_set(iteration):
     ts = datetime.datetime.now().strftime('%d%m%H%M%S')
     print(f"\n{'='*60}")
-    print(f"  AAPL Intraday Backtest  |  run {ts}")
+    print(f"{iteration}:  AAPL Intraday Backtest  |  start at {ts}")
     print(f"{'='*60}\n")
 
     # 1. Load / build signals CSV
@@ -641,15 +641,15 @@ def run_model_set():
         (df['date'] <= pd.Timestamp(DATE_END))
     )
     df = df[mask].reset_index(drop=True)
-    print(f"[filter]  {DATE_START} -> {DATE_END}: {len(df):,} rows")
+    print(f"{iteration}:[filter]  {DATE_START} -> {DATE_END}: {len(df):,} rows")
     if len(df) == 0:
-        sys.exit("ERROR: No data in the specified date range.")
+        sys.exit("{iteration}:ERROR: No data in the specified date range.")
 
     # 3. Fixed sample
     sample_idx = draw_sample(df)
 
     # 4. Build day-level structures once (reused across all 1,221 models)
-    print("[index]   Building day index ...")
+    print(f"{iteration}:[index]   Building day index ...")
     df = df.copy()
     df['_day_pos'] = df.groupby('fnd_trade_date').cumcount()
 
@@ -662,7 +662,7 @@ def run_model_set():
         for pos, global_idx in enumerate(group.index):
             day_pos_map[global_idx] = pos
 
-    print(f"          Trading days indexed: {len(day_dict):,}")
+    print(f"{iteration}:          Trading days indexed: {len(day_dict):,}")
 
     # 5. Run all models
     summary_df, trades_df = run_all_models(
@@ -673,34 +673,34 @@ def run_model_set():
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     trades_path = REPORTS_DIR / f'trades_{ts}.csv'
     trades_df.to_csv(trades_path, index=False)
-    print(f"[output]  Trades CSV -> {trades_path}  ({len(trades_df):,} records)")
+    print(f"{iteration}:[output]  Trades CSV -> {trades_path}  ({len(trades_df):,} records)")
 
     # 7. Write reports
     n_valid  = len(generate_combos())
     n_trades = len(trades_df)
-    write_summary_report(summary_df, ts, n_valid, n_trades)
-    write_detailed_report(trades_df, summary_df, ts)
+    write_summary_report(summary_df, iteration, ts, n_valid, n_trades)
+    # write_detailed_report(trades_df, summary_df, ts)
 
     # 8. Console summary
     sdf_active = summary_df[summary_df['trades'] > 0]
     print(f"\n{'='*60}")
-    print(f"  RUN COMPLETE")
+    print(f"{iteration}:  RUN COMPLETE")
     print(f"{'='*60}")
-    print(f"  Models run       : {len(summary_df):,}")
-    print(f"  Models w/ trades : {len(sdf_active):,}")
-    print(f"  Total trades     : {n_trades:,}")
+    print(f"{iteration}:  Models run       : {len(summary_df):,}")
+    print(f"{iteration}:  Models w/ trades : {len(sdf_active):,}")
+    print(f"{iteration}:  Total trades     : {n_trades:,}")
 
     if not sdf_active.empty:
         best  = sdf_active.loc[sdf_active['total_pnl'].idxmax()]
         worst = sdf_active.loc[sdf_active['total_pnl'].idxmin()]
         print(
-            f"  Best  model : #{int(best['model_id'])} "
+            f"{iteration}:  Best  model : #{int(best['model_id'])} "
             f"{best['trend'].upper()}+{best['momentum'].upper()}+"
             f"{best['volatility'].upper()}+{best['volume'].upper()} "
             f"  P&L=${best['total_pnl']:,.2f}  Sharpe={best['sharpe']:.2f}"
         )
         print(
-            f"  Worst model : #{int(worst['model_id'])} "
+            f"{iteration}:  Worst model : #{int(worst['model_id'])} "
             f"{worst['trend'].upper()}+{worst['momentum'].upper()}+"
             f"{worst['volatility'].upper()}+{worst['volume'].upper()} "
             f"  P&L=${worst['total_pnl']:,.2f}  Sharpe={worst['sharpe']:.2f}"
@@ -710,10 +710,26 @@ def run_model_set():
     return summary_df
 
 if __name__ == '__main__':
-    # create an array of 100 random seeds
+    ts = datetime.datetime.now().strftime('%d%m%H%M%S')
     random_seeds = np.random.choice(10000, size=100, replace=False)
-    for each in random_seeds:
-        RANDOM_SEED = each
-        # execute the backtest 100 times with different seeds
-        df = run_model_set()
+    batch_results = []
 
+    for idx, seed in enumerate(random_seeds, 0):
+        RANDOM_SEED = int(seed)
+        result_df = run_model_set(idx)
+        batch_results.append(result_df)
+
+    batch_results_df = pd.concat(batch_results, ignore_index=True)
+
+    # Print summary
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+    print("\nBatch Results Summary:")
+    print(batch_results_df.describe())
+    print(f"\nTotal rows: {len(batch_results_df):,}")
+
+    # Save to file
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = REPORTS_DIR / f'batch_results_{ts}.csv'
+    batch_results_df.to_csv(output_path, index=False)
+    print(f"\nBatch results saved -> {output_path}")
