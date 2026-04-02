@@ -47,7 +47,7 @@ Column prefix conventions:
  | adx_   | ADX/DMI               | adx_14, adx_plus_di, adx_minus_di, adx_trend_gate       | 
  | atr_   | ATR                   | atr_14, atr_stop_15x, atr_tgt_2rr, atr_spike            | 
  | rsi_   | RSI                   | rsi_14, rsi_cross_50, rsi_cross_30                      | 
- | sto_   | Stochastic            | sto_k, sto_d, sto_cross_up                              | 
+ | sto_   | Stochastic          [batch_run_analysis.md](reports/batch_run_analysis.md)  | sto_k, sto_d, sto_cross_up                              | 
  | cci_   | CCI                   | cci_20, cci_cross_0, cci_cross_m100                     | 
  | bbd_   | Bollinger Bands       | bbd_width, bbd_squeeze, bbd_pct_b, bbd_upper, bbd_lower | 
  | chp_   | Choppiness Index      | chp_14, chp_trending, chp_ranging, chp_regime           | 
@@ -237,16 +237,39 @@ On second and subsequent model.py runs, the signals CSV is loaded directly (skip
 
 
 ## Key Design Decisions
-| Decision                | Choice                                 | Rationale                                                                       | 
-|-------------------------|----------------------------------------|---------------------------------------------------------------------------------| 
-| Combination constraint  | No indicator in two slots              | MACD and FRC appear in two categories; prevents double-counting                 | 
-| Sample strategy         | Fixed 10,000 rows across all models    | Enables fair model comparison — differences are signal-driven not sample-driven | 
-| Buy screening           | Vectorized bitwise AND                 | Eliminates 99%+ of candidate bars before simulation loop                        | 
-| Sell exit scope         | Only the 4 model indicators            | Keeps exit logic coupled to entry logic                                         | 
-| VWAP reset              | Per fnd_trade_date groupby             | Intraday VWAP must restart each session                                         | 
-| SAR/Klinger             | Explicit Python loops in helpers       | State dependencies between bars prevent vectorization                           | 
-| Memory                  | float32 for indicators, int8 for flags | Halves memory on 350k × 158 column DataFrame                                    | 
-| Commission              | $2.00 deducted from pnl_dollar         | $1.00/leg × 2 legs, IBKR Lite/Pro single-contract rate                          | 
+| Decision                | Choice                                 | Rationale                                                                       |
+|-------------------------|----------------------------------------|---------------------------------------------------------------------------------|
+| Combination constraint  | No indicator in two slots              | MACD and FRC appear in two categories; prevents double-counting                 |
+| Sample strategy         | Fixed 10,000 rows across all models    | Enables fair model comparison — differences are signal-driven not sample-driven |
+| Buy screening           | Vectorized bitwise AND                 | Eliminates 99%+ of candidate bars before simulation loop                        |
+| Sell exit scope         | Only the 4 model indicators            | Keeps exit logic coupled to entry logic                                         |
+| VWAP reset              | Per fnd_trade_date groupby             | Intraday VWAP must restart each session                                         |
+| SAR/Klinger             | Explicit Python loops in helpers       | State dependencies between bars prevent vectorization                           |
+| Memory                  | float32 for indicators, int8 for flags | Halves memory on 350k × 158 column DataFrame                                    |
+| Commission              | $2.00 deducted from pnl_dollar         | $1.00/leg × 2 legs, IBKR Lite/Pro single-contract rate                          |
+
+## Entry Snapshot Fields
+These four fields are captured at the moment of trade entry for post-hoc analysis. They do not affect the trade decision (the buy signal has already fired). They are stored in the trades CSV and log file.
+
+| Field | Source Column | What it measures at entry |
+|---|---|---|
+| `atr_at_entry` | `atr_14` | Average True Range over 14 bars — the volatility "width" at entry; used to compute stop distance and profit target |
+| `rsi_at_entry` | `rsi_14` | Relative Strength Index (0–100) — momentum reading; >70 = overbought, <30 = oversold |
+| `adx_at_entry` | `adx_14` | Average Directional Index — trend strength (not direction); >25 = trending, <20 = choppy/ranging |
+| `vwap_at_entry` | `vwp_vwap` | Volume-Weighted Average Price for the session — whether entry is above or below the day's fair value |
+
+Useful for post-trade filtering: e.g. "did trades entered when RSI > 80 perform worse?" or "did high-ADX entries have better follow-through?"
+
+## Trade Price Sources
+| Situation | Column Used | Why |
+|---|---|---|
+| Entry cost | `avg_ask` | Actual price paid to buy |
+| Bracket computation (stop/target levels) | `average` (WAP) | WAP is the fair reference for stop/target levels |
+| High-water mark seed | `average` (WAP) at entry | Must match the same series being tracked each bar |
+| Trailing stop update each bar | `bar['average']` | Consistent WAP-based decision making |
+| Stop-loss trigger | `bar['average'] <= trailing_stop` | WAP crossing stop is more reliable than a wick |
+| Exit price (stop hit) | `avg_bid` | Actual price the market pays on exit |
+| Exit price (EOD forced) | `avg_bid` | Actual price the market pays on exit |
 
 
 
