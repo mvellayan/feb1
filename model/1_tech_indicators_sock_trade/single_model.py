@@ -43,13 +43,13 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
-from indicator_signals import add_buy_signals, add_sell_signals
-from batch_run_utils import REPORTS_DIR, PF_CAP, md_table
+from signals import add_buy_signals, add_sell_signals
+from utils import REPORTS_DIR, PF_CAP, md_table
 
 warnings.filterwarnings('ignore')
 
 # ── file paths ─────────────────────────────────────────────────────────────────
-_BASE        = Path(__file__).parent.parent
+_BASE        = Path(__file__).parent.parent.parent
 EXTENDED_CSV = _BASE / 'data/stock/sq_AAPL_extended.csv'
 SIGNALS_CSV  = _BASE / 'data/stock/sq_AAPL_signals.csv'
 

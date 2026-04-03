@@ -1,14 +1,15 @@
 """
-batch_run_all_models.py
+all_models.py
 
-Orchestrates all 1,221 indicator combinations across 100 time windows.
+Orchestrates all 1,221 indicator combinations across 100 time windows,
+then analyses and ranks indicator consistency across those runs.
 
-Simulation logic lives entirely in batch_run_single_model.py.
+Simulation logic lives entirely in single_model.py.
 This file handles:
   - combination generation  (TREND × MOMENTUM × VOLATILITY × VOLUME)
   - window scheduling       (100 unique windows per execution)
   - CSV and log output
-  - post-execution analysis via summarize_all_runs
+  - post-execution analysis and markdown report
 
 Pipeline per window
 ───────────────────
@@ -16,13 +17,17 @@ Pipeline per window
 2.  S.prepare_window(...)           — filter window, draw sample, build day structures
 3.  run_all_models(...)             — loop 1,221 combos, call S.run_combo() for each
 4.  write_summary_csv / trades_csv  — persist results
-5.  summarize_all_runs.main()       — rank indicators after all 100 windows complete
+5.  summarize_run(run_dir)          — rank indicators after all 100 windows complete
 
 Output  ../reports/{mmddhhmi}/
 ──────
   {seq_no}_summary.csv
   {seq_no}_trades.csv
   {seq_no}_run.log
+  analysis_models.csv
+  analysis_{trend,momentum,volatility,volume}.csv
+  analysis_pair_{cat_a}_{cat_b}.csv  (6 pairs)
+  batch_run_analysis.md
 """
 
 from __future__ import annotations
@@ -38,9 +43,12 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
-import batch_run_single_model as S
-import summarize_all_runs
-from batch_run_utils import REPORTS_DIR
+import single_model as S
+from utils import (
+    REPORTS_DIR, TOP_N, CATEGORIES, PF_CAP, MIN_BATCHES,
+    load_all_summaries, analyse_full_models, analyse_category, analyse_pair,
+    md_table,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -154,17 +162,14 @@ def run_all_models(
             **metrics,
         })
 
-        # Prepend batch/model context to each trade
         model_trades = [{'batch_no': seq_no, 'model_no': model_id, **tr} for tr in raw_trades]
 
-        # Write log block (only models with trades)
         if model_trades and log_fh is not None:
             S._log_model_start(log_fh, seq_no, model_id, t, m, v, vol)
             for tr in model_trades:
                 S._log_trade(log_fh, tr)
             S._log_model_end(log_fh, seq_no, model_id, metrics)
 
-        # Strip _evals before accumulating for CSV
         for tr in model_trades:
             tr.pop('_evals', None)
         all_trades.extend(model_trades)
@@ -190,10 +195,8 @@ def run_model_set(seq_no: int, run_dir: Path, end_of_week_exit: bool = False):
     print(f"[{seq_no}]  Window: {DATE_START} -> {DATE_END}  seed: {RANDOM_SEED}  exit: {exit_mode}")
     print(f"{'='*60}\n")
 
-    # 1. Load signals (cached after first call)
     df_full = S.load_or_build_signals()
 
-    # 2. Filter window, draw sample, build day structures
     window_data, wstatus = S.prepare_window(df_full, DATE_START, DATE_END, RANDOM_SEED)
     if window_data is None:
         sys.exit(f"[{seq_no}] ERROR: {wstatus} for {DATE_START} -> {DATE_END}")
@@ -201,7 +204,6 @@ def run_model_set(seq_no: int, run_dir: Path, end_of_week_exit: bool = False):
     print(f"[{seq_no}][filter]  {DATE_START} -> {DATE_END}: {len(df):,} rows")
     print(f"[{seq_no}]          Trading days indexed: {len(day_dict):,}")
 
-    # 3. Run all 1,221 models (streaming log written during execution)
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / f'{seq_no}_run.log'
     with open(log_path, 'w', encoding='utf-8') as log_fh:
@@ -216,12 +218,10 @@ def run_model_set(seq_no: int, run_dir: Path, end_of_week_exit: bool = False):
         )
     print(f"[{seq_no}][report]  Log      -> {log_path}")
 
-    # 4. Write CSV reports
     write_summary_csv(summary_df, seq_no, run_dir)
     if not trades_df.empty:
         write_trades_csv(trades_df, seq_no, run_dir)
 
-    # 5. Console summary
     sdf_active = summary_df[summary_df['n_trades'] > 0]
     print(f"\n{'='*60}")
     print(f"[{seq_no}]  RUN COMPLETE")
@@ -250,6 +250,146 @@ def run_model_set(seq_no: int, run_dir: Path, end_of_week_exit: bool = False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ANALYSIS — MARKDOWN REPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_markdown_report(models_df, category_dfs, pair_dfs, n_batches, total_rows, run_dir):
+    now  = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    path = run_dir / 'batch_run_analysis.md'
+
+    lines = []
+    lines.append('# Batch Run Analysis — Indicator Consistency Report')
+    lines.append(f'\n_Generated: {now}_\n')
+    lines.append('## Overview\n')
+    lines.append('| Metric | Value |')
+    lines.append('|---|---|')
+    lines.append(f'| Run directory           | {run_dir.name} |')
+    lines.append(f'| Runs analysed           | {n_batches} |')
+    lines.append(f'| Total model-runs        | {total_rows:,} |')
+    lines.append(f'| Unique models (4-tuple) | {len(models_df):,} |')
+    lines.append(f'| Min runs threshold      | {MIN_BATCHES} |')
+    lines.append(f'| Profit factor cap       | {PF_CAP} |')
+    lines.append('')
+    lines.append('### Consistency Score Formula\n')
+    lines.append('```')
+    lines.append('score = 0.40 × pnl_hit_rate')
+    lines.append('      + 0.25 × sharpe_hit_rate')
+    lines.append('      + 0.20 × avg_win_rate / 100')
+    lines.append('      + 0.15 × avg_profit_factor / 10')
+    lines.append('(all terms normalised to 0–1, score reported 0–100)')
+    lines.append('```\n')
+
+    display_model_cols = [
+        'rank', 'trend', 'momentum', 'volatility', 'volume',
+        'batch_count', 'avg_trades', 'avg_win_rate', 'avg_total_pnl',
+        'pnl_hit_rate', 'avg_sharpe', 'avg_pf', 'consistency_score',
+    ]
+
+    lines.append(f'## Top {TOP_N} Full Model Combinations\n')
+    lines.append(md_table(models_df[display_model_cols]))
+    lines.append('')
+
+    bottom = models_df[display_model_cols].tail(TOP_N).iloc[::-1].copy()
+    bottom['rank'] = range(1, len(bottom) + 1)
+    lines.append(f'## Bottom {TOP_N} Full Model Combinations\n')
+    lines.append(md_table(bottom))
+    lines.append('')
+
+    for cat, cdf in category_dfs.items():
+        display_cols = [
+            'rank', cat, 'batch_count', 'avg_trades', 'avg_win_rate',
+            'avg_total_pnl', 'pnl_hit_rate', 'avg_sharpe', 'consistency_score',
+        ]
+        lines.append(f'## {cat.capitalize()} Indicator Rankings\n')
+        lines.append(md_table(cdf[display_cols], n=len(cdf)))
+        lines.append('')
+
+    for (cat_a, cat_b), pdf in pair_dfs.items():
+        display_cols = [
+            'rank', cat_a, cat_b, 'batch_count', 'avg_trades',
+            'avg_win_rate', 'avg_total_pnl', 'pnl_hit_rate',
+            'avg_sharpe', 'consistency_score',
+        ]
+        lines.append(f'## Pair Rankings: {cat_a.capitalize()} × {cat_b.capitalize()}\n')
+        lines.append(md_table(pdf[display_cols]))
+        lines.append('')
+
+    path.write_text('\n'.join(lines), encoding='utf-8')
+    print(f"[report]  Markdown  -> {path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANALYSIS — SUMMARIZE RUN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def summarize_run(run_dir: Path):
+    print(f"\n{'='*60}")
+    print(f"  Batch Run Analysis — {run_dir.name}")
+    print(f"{'='*60}\n")
+
+    df, n_batches = load_all_summaries(run_dir=run_dir)
+
+    print("[analyse] Full model combinations ...")
+    models_df = analyse_full_models(df, n_batches)
+    models_df.to_csv(run_dir / 'analysis_models.csv', index=False)
+    print(f"          {len(models_df):,} models ranked  ->  analysis_models.csv")
+
+    category_dfs = {}
+    for cat in CATEGORIES:
+        print(f"[analyse] {cat} indicators ...")
+        cdf = analyse_category(df, n_batches, cat)
+        cdf.to_csv(run_dir / f'analysis_{cat}.csv', index=False)
+        print(f"          {len(cdf)} indicators  ->  analysis_{cat}.csv")
+        category_dfs[cat] = cdf
+
+    pair_dfs = {}
+    pairs = [
+        ('trend',      'momentum'),
+        ('trend',      'volatility'),
+        ('trend',      'volume'),
+        ('momentum',   'volatility'),
+        ('momentum',   'volume'),
+        ('volatility', 'volume'),
+    ]
+    for cat_a, cat_b in pairs:
+        print(f"[analyse] Pair {cat_a} × {cat_b} ...")
+        pdf = analyse_pair(df, n_batches, cat_a, cat_b)
+        out_name = f'analysis_pair_{cat_a}_{cat_b}.csv'
+        pdf.to_csv(run_dir / out_name, index=False)
+        print(f"          {len(pdf)} pairs ranked  ->  {out_name}")
+        pair_dfs[(cat_a, cat_b)] = pdf
+
+    print("\n[report]  Writing markdown ...")
+    write_markdown_report(models_df, category_dfs, pair_dfs, n_batches, len(df), run_dir)
+
+    print(f"\n{'='*60}")
+    print("  TOP 5 CONSISTENT MODELS")
+    print(f"{'='*60}")
+    for _, r in models_df.head(5).iterrows():
+        print(
+            f"  #{int(r['rank']):>3}  "
+            f"{r['trend'].upper():>4}+{r['momentum'].upper():<5}+"
+            f"{r['volatility'].upper():>3}+{r['volume'].upper():<4}  "
+            f"score={r['consistency_score']:.1f}  "
+            f"pnl_hit={r['pnl_hit_rate']*100:.0f}%  "
+            f"avg_pnl=${r['avg_total_pnl']:,.0f}  "
+            f"avg_sharpe={r['avg_sharpe']:.2f}"
+        )
+
+    print(f"\n{'='*60}")
+    print("  INDICATOR RANKINGS BY CATEGORY")
+    print(f"{'='*60}")
+    for cat, cdf in category_dfs.items():
+        ranked = '  >  '.join(
+            f"{r[cat].upper()}({r['consistency_score']:.0f})"
+            for _, r in cdf.iterrows()
+        )
+        print(f"  {cat.upper():<12}: {ranked}")
+
+    print(f"\n{'='*60}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -266,14 +406,11 @@ if __name__ == '__main__':
     DATA_LAST   = datetime.date(2026, 2, 28)
     WINDOW_DAYS = 14
 
-    # One output directory per execution
     run_ts  = datetime.datetime.now().strftime('%m%d%H%M')
     run_dir = REPORTS_DIR / run_ts
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[main]  Output directory: {run_dir}")
 
-    # Master RNG generates both window offsets and per-run seeds together,
-    # ensuring each window gets a unique (window, seed) pair.
     max_start  = DATA_LAST - datetime.timedelta(days=WINDOW_DAYS)
     total_days = (max_start - DATA_FIRST).days
 
@@ -290,8 +427,4 @@ if __name__ == '__main__':
         print(f"[{seq_no}]  Window: {DATE_START} -> {DATE_END}  (seed={RANDOM_SEED})")
         run_model_set(seq_no, run_dir, end_of_week_exit=END_OF_WEEK_EXIT)
 
-    # Summarise all runs in this execution
-    print(f"\n{'='*60}")
-    print(f"  Running summarize_all_runs for {run_dir.name}")
-    print(f"{'='*60}\n")
-    summarize_all_runs.main(run_dir=run_dir)
+    summarize_run(run_dir)
