@@ -1,5 +1,5 @@
 """
-batch_run_single_model.py
+single_model.py
 
 Core trading simulation engine. Also runs as a standalone script to test a
 single indicator combination across 100 time windows.
@@ -19,9 +19,9 @@ Engine functions (imported by batch_run_all_models.py)
 
 Standalone usage
 ─────────────────
-  python batch_run_single_model.py
-  python batch_run_single_model.py --trend adx --momentum frc --volatility atr --volume vrc
-  python batch_run_single_model.py --trend ema --momentum rsi   # blank volatility + volume
+  python single_model.py
+  python single_model.py --trend adx --momentum frc --volatility atr --volume vrc
+  python single_model.py --trend ema --momentum rsi   # blank volatility + volume
 
 Output  (../reports/single_{combo}_{mmddhhmi}/)
 ──────

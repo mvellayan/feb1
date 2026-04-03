@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /Users/muthu/Development/feb1/reports/*_summary.csv)"
+    ]
+  }
+}
