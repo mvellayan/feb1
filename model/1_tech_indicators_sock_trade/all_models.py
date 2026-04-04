@@ -33,7 +33,9 @@ Output  ../reports/{mmddhhmi}/
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
+import os
 import secrets
 import sys
 import warnings
@@ -188,29 +190,37 @@ def run_all_models(
 # SINGLE WINDOW EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_model_set(seq_no: int, run_dir: Path, end_of_week_exit: bool = False):
-    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+def run_model_set(
+    seq_no:           int,
+    run_dir:          Path,
+    date_start:       str,
+    date_end:         str,
+    seed:             int,
+    end_of_week_exit: bool = False,
+):
+    ts        = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     exit_mode = 'end-of-week' if end_of_week_exit else 'end-of-day'
     print(f"\n{'='*60}")
     print(f"[{seq_no}]  AAPL Intraday Backtest  |  start at {ts}")
-    print(f"[{seq_no}]  Window: {DATE_START} -> {DATE_END}  seed: {RANDOM_SEED}  exit: {exit_mode}")
+    print(f"[{seq_no}]  Window: {date_start} -> {date_end}  seed: {seed}  exit: {exit_mode}")
     print(f"{'='*60}\n")
 
-    df_full = S.load_or_build_signals()
+    df_full = S.load_or_build_signals()   # cached after first load in this process
 
-    window_data, wstatus = S.prepare_window(df_full, DATE_START, DATE_END, RANDOM_SEED)
+    window_data, wstatus = S.prepare_window(df_full, date_start, date_end, seed)
     if window_data is None:
-        sys.exit(f"[{seq_no}] ERROR: {wstatus} for {DATE_START} -> {DATE_END}")
+        print(f"[{seq_no}] ERROR: {wstatus} for {date_start} -> {date_end}")
+        return
     df, sample_idx, day_dict, day_pos_map = window_data
-    print(f"[{seq_no}][filter]  {DATE_START} -> {DATE_END}: {len(df):,} rows")
+    print(f"[{seq_no}][filter]  {date_start} -> {date_end}: {len(df):,} rows")
     print(f"[{seq_no}]          Trading days indexed: {len(day_dict):,}")
 
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / f'{seq_no}_run.log'
     with open(log_path, 'w', encoding='utf-8') as log_fh:
         log_fh.write(
-            f"seq_no: [{seq_no}]  window: {DATE_START} -> {DATE_END}"
-            f"  seed: {RANDOM_SEED}  exit_mode: [{exit_mode}]  generated: {ts}\n"
+            f"seq_no: [{seq_no}]  window: {date_start} -> {date_end}"
+            f"  seed: {seed}  exit_mode: [{exit_mode}]  generated: {ts}\n"
         )
         summary_df, trades_df = run_all_models(
             df, sample_idx, day_dict, day_pos_map, seq_no,
@@ -248,6 +258,18 @@ def run_model_set(seq_no: int, run_dir: Path, end_of_week_exit: bool = False):
         )
 
     print(f"{'='*60}\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Top-level worker wrapper — must be at module level to be picklable by
+# multiprocessing on macOS/Windows (spawn start method).
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _run_window(args: tuple) -> int:
+    """Unpack args and run one window. Returns seq_no on success."""
+    seq_no, run_dir, date_start, date_end, seed, end_of_week_exit = args
+    run_model_set(seq_no, run_dir, date_start, date_end, seed, end_of_week_exit)
+    return seq_no
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -404,10 +426,16 @@ if __name__ == '__main__':
         '--seed', type=int, default=None,
         help='Master RNG seed (omit for a fresh random seed each run)',
     )
+    _parser.add_argument(
+        '--workers', type=int, default=max(1, (os.cpu_count() or 1) - 1),
+        help='Number of parallel worker processes (default: cpu_count - 1)',
+    )
     _args = _parser.parse_args()
     END_OF_WEEK_EXIT = _args.end_of_week_exit
     RANDOM_SEED = _args.seed if _args.seed is not None else secrets.randbelow(2**32)
-    print(f"[main]  Master seed: {RANDOM_SEED}")
+    N_WORKERS   = _args.workers
+    print(f"[main]  Master seed : {RANDOM_SEED}")
+    print(f"[main]  Workers     : {N_WORKERS}")
 
     DATA_FIRST  = datetime.date(2023, 1, 1)
     DATA_LAST   = datetime.date(2026, 2, 28)
@@ -418,20 +446,47 @@ if __name__ == '__main__':
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[main]  Output directory: {run_dir}")
 
+    # ── Build the signals CSV in the main process before spawning workers.
+    # This avoids multiple workers racing to write the same file.
+    print("[main]  Loading/building signals CSV ...")
+    S.load_or_build_signals()
+    print("[main]  Signals ready.\n")
+
+    # ── Generate all 100 window specs ─────────────────────────────────────────
     max_start  = DATA_LAST - datetime.timedelta(days=WINDOW_DAYS)
     total_days = (max_start - DATA_FIRST).days
 
     master_rng = np.random.default_rng(RANDOM_SEED)
     offsets    = master_rng.choice(total_days, size=100, replace=False).tolist()
     run_seeds  = master_rng.integers(1, 10_000, size=100).tolist()
+    runs       = sorted(zip(offsets, run_seeds), key=lambda x: x[0])
 
-    runs = sorted(zip(offsets, run_seeds), key=lambda x: x[0])
-
+    window_args = []
     for seq_no, (offset, seed) in enumerate(runs, 1):
-        DATE_START  = (DATA_FIRST + datetime.timedelta(days=int(offset))).strftime('%Y-%m-%d')
-        DATE_END    = (DATA_FIRST + datetime.timedelta(days=int(offset) + WINDOW_DAYS)).strftime('%Y-%m-%d')
-        RANDOM_SEED = int(seed)
-        print(f"[{seq_no}]  Window: {DATE_START} -> {DATE_END}  (seed={RANDOM_SEED})")
-        run_model_set(seq_no, run_dir, end_of_week_exit=END_OF_WEEK_EXIT)
+        date_start = (DATA_FIRST + datetime.timedelta(days=int(offset))).strftime('%Y-%m-%d')
+        date_end   = (DATA_FIRST + datetime.timedelta(days=int(offset) + WINDOW_DAYS)).strftime('%Y-%m-%d')
+        window_args.append((seq_no, run_dir, date_start, date_end, int(seed), END_OF_WEEK_EXIT))
+        print(f"  [{seq_no:>3}]  {date_start} -> {date_end}  seed={seed}")
 
+    # ── Dispatch to worker pool ────────────────────────────────────────────────
+    print(f"\n[main]  Submitting {len(window_args)} windows to {N_WORKERS} workers ...\n")
+    completed = 0
+    failed    = 0
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
+        futures = {pool.submit(_run_window, args): args[0] for args in window_args}
+        for fut in concurrent.futures.as_completed(futures):
+            seq_no = futures[fut]
+            try:
+                fut.result()
+                completed += 1
+            except Exception as exc:
+                failed += 1
+                print(f"[main]  ERROR — window {seq_no} failed: {exc}")
+            print(f"[main]  Progress: {completed + failed}/{len(window_args)} done  "
+                  f"({completed} ok, {failed} failed)")
+
+    print(f"\n[main]  All windows finished.  {completed} ok / {failed} failed.")
+
+    # ── Post-run analysis (single-threaded, all CSVs now written) ─────────────
     summarize_run(run_dir)

@@ -66,6 +66,7 @@ ATR_STOP_MULT        = 1.5
 ATR_TARGET_RR        = 2.0
 CC_BUYBACK_THRESHOLD = 0.50    # buy back the short call if ask drops below this
 CC_MAX_EXPIRY_DAYS   = 4       # max calendar days to Friday expiration
+MAX_STRIKE_GAP       = 2.0     # max $ distance between found strike and target strike
 
 # ── standalone run constants ───────────────────────────────────────────────────
 N_RUNS      = 100
@@ -211,7 +212,13 @@ def find_covered_call_option(
     if cands.empty:
         return None
 
-    return cands.loc[cands['strike_price'].idxmax()].to_dict()
+    best_row = cands.loc[cands['strike_price'].idxmax()]
+    strike   = float(best_row['strike_price'])
+    gap      = max_strike - strike          # how far below the target
+    if gap > MAX_STRIKE_GAP:
+        return None
+
+    return best_row.to_dict()
 
 
 def find_best_covered_call(
@@ -239,9 +246,28 @@ def find_best_covered_call(
     for offset in (1.0, 2.0, 3.0, 4.0, 5.0):
         contract = find_covered_call_option(trigger_date, trigger_avg, strike_offset=offset)
         if contract is None:
+            # distinguish "no contract at all" from "strike too far"
+            # re-check what the best available strike was (without the gap filter)
+            option_index = load_option_index()
+            dow        = trigger_date.weekday()
+            days_ahead = (4 - dow) % 7
+            friday     = trigger_date + datetime.timedelta(days=days_ahead)
+            expiry_int = int(friday.strftime('%y%m%d'))
+            max_strike = trigger_avg - offset
+            raw_cands  = option_index[
+                (option_index['call_put']        == 'C') &
+                (option_index['expiration_date'] == expiry_int) &
+                (option_index['strike_price']    <= max_strike)
+            ]
+            if raw_cands.empty:
+                skip_reason = 'no contract'
+            else:
+                found_strike = float(raw_cands['strike_price'].max())
+                gap          = max_strike - found_strike
+                skip_reason  = f'strike too far (${gap:.1f} away)'
             candidates.append({'offset': offset, 'strike': None, 'symbol': None,
                                 'premium': None, 'itm_pnl': None, 'chosen': False,
-                                'skip_reason': 'no contract'})
+                                'skip_reason': skip_reason})
             continue
         strike = float(contract['strike_price'])
         if strike in seen_strikes:
