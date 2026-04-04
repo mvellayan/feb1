@@ -320,11 +320,29 @@ def _build_eow_context(
 # LOG WRITERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-_LOG_WIDTH = 72
+_LOG_WIDTH    = 72
+_LOG_EVAL_HEAD = 5
+_LOG_EVAL_TAIL = 5
 
 
 def _ruler(label: str) -> str:
     return label + '-' * max(0, _LOG_WIDTH - len(label))
+
+
+def _write_evals(fh, header: str, rows: list, fmt):
+    """Write an eval table limited to first/last N rows."""
+    if not rows:
+        return
+    fh.write(f"    {header}\n")
+    head = rows[:_LOG_EVAL_HEAD]
+    tail = rows[_LOG_EVAL_TAIL * -1:] if len(rows) > _LOG_EVAL_HEAD + _LOG_EVAL_TAIL else []
+    skip = len(rows) - len(head) - len(tail)
+    for r in head:
+        fh.write(fmt(r))
+    if skip > 0:
+        fh.write(f"    ... {skip} bars skipped ...\n")
+    for r in tail:
+        fh.write(fmt(r))
 
 
 def _log_model_start(fh, seq_no, model_id, t, m, v, vol):
@@ -355,10 +373,10 @@ def _log_trade(fh, tr):
     )
     fh.write("\n")
 
-    fh.write("    eval_time    eval_price    stop_loss\n")
-    for eval_time, eval_price, cur_stop in tr.get('_evals', []):
-        t_part = str(eval_time).split(' ')[-1] if ' ' in str(eval_time) else str(eval_time)
-        fh.write(f"    {t_part}    {eval_price}    {cur_stop}\n")
+    def _fmt(r):
+        t = str(r[0]).split(' ')[-1] if ' ' in str(r[0]) else str(r[0])
+        return f"    {t}    {r[1]}    {r[2]}\n"
+    _write_evals(fh, "eval_time    eval_price    stop_loss", tr.get('_evals', []), _fmt)
     fh.write("\n")
 
     fh.write(

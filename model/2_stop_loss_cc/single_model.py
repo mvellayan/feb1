@@ -596,6 +596,27 @@ def _log_model_start(fh, seq_no, model_id, t, m, v, vol):
     fh.write("\n----- Details\n\n")
 
 
+_LOG_EVAL_HEAD = 5   # bars shown at start of each eval table
+_LOG_EVAL_TAIL = 5   # bars shown at end of each eval table
+
+
+def _write_evals(fh, header: str, rows: list, fmt):
+    """Write an eval table limited to first/last N rows."""
+    if not rows:
+        return
+    fh.write(f"    {header}\n")
+    head = rows[:_LOG_EVAL_HEAD]
+    tail = rows[_LOG_EVAL_TAIL * -1:] if len(rows) > _LOG_EVAL_HEAD + _LOG_EVAL_TAIL else []
+    skip = len(rows) - len(head) - len(tail)
+    for r in head:
+        fh.write(fmt(r))
+    if skip > 0:
+        fh.write(f"    ... {skip} bars skipped ...\n")
+    for r in tail:
+        fh.write(fmt(r))
+    fh.write("\n")
+
+
 def _log_trade(fh, tr):
     fh.write(
         f"trade_no: [{tr['trade_no']}], "
@@ -617,24 +638,21 @@ def _log_trade(fh, tr):
     fh.write("\n")
 
     # ── Phase 1: trailing-stop evals (entry → stop trigger or EOD) ────────────
-    pre_evals = tr.get('_evals', [])
-    if pre_evals:
-        fh.write("    eval_time    stock_avg    trailing_stop\n")
-        for eval_time, stock_avg, cur_stop in pre_evals:
-            t_part = str(eval_time).split(' ')[-1] if ' ' in str(eval_time) else str(eval_time)
-            fh.write(f"    {t_part}    {stock_avg}    {cur_stop}\n")
-        fh.write("\n")
+    def _fmt_stop(r):
+        t = str(r[0]).split(' ')[-1] if ' ' in str(r[0]) else str(r[0])
+        return f"    {t}    {r[1]}    {r[2]}\n"
+    _write_evals(fh, "eval_time    stock_avg    trailing_stop", tr.get('_evals', []), _fmt_stop)
 
     # ── Phase 2: covered call (only when CC was opened) ───────────────────────
-    cc_evals     = tr.get('_cc_evals', [])
+    cc_evals      = tr.get('_cc_evals', [])
     cc_candidates = tr.get('_cc_candidates', [])
     if cc_candidates:
         fh.write("cc_candidates considered:\n")
         fh.write("    offset  strike      symbol                  premium  itm_pnl  chosen\n")
         for c in cc_candidates:
-            strike  = f"{c['strike']:.2f}"   if c['strike']  is not None else 'n/a'
-            premium = f"{c['premium']:.4f}"  if c['premium'] is not None else 'n/a'
-            itm_pnl = f"{c['itm_pnl']:.2f}"  if c['itm_pnl'] is not None else 'n/a'
+            strike  = f"{c['strike']:.2f}"  if c['strike']  is not None else 'n/a'
+            premium = f"{c['premium']:.4f}" if c['premium'] is not None else 'n/a'
+            itm_pnl = f"{c['itm_pnl']:.2f}" if c['itm_pnl'] is not None else 'n/a'
             symbol  = str(c.get('symbol') or c.get('skip_reason') or '')
             chosen  = '<<< chosen' if c['chosen'] else ''
             fh.write(f"    ${c['offset']:.0f}     {strike:<10}  {symbol:<24}  {premium:<7}  {itm_pnl:<8}  {chosen}\n")
@@ -649,12 +667,11 @@ def _log_trade(fh, tr):
             f"buyback threshold: {CC_BUYBACK_THRESHOLD})\n"
         )
         fh.write("\n")
-        if cc_evals:
-            fh.write("    eval_time    stock_avg    option_ask\n")
-            for eval_time, stock_avg, opt_ask in cc_evals:
-                t_part = str(eval_time).split(' ')[-1] if ' ' in str(eval_time) else str(eval_time)
-                fh.write(f"    {t_part}    {stock_avg}    {opt_ask}\n")
-            fh.write("\n")
+
+        def _fmt_cc(r):
+            t = str(r[0]).split(' ')[-1] if ' ' in str(r[0]) else str(r[0])
+            return f"    {t}    {r[1]}    {r[2]}\n"
+        _write_evals(fh, "eval_time    stock_avg    option_ask", cc_evals, _fmt_cc)
 
     # ── Exit ──────────────────────────────────────────────────────────────────
     fh.write(
@@ -666,11 +683,28 @@ def _log_trade(fh, tr):
     fh.write(
         f"shares: [{tr['shares']}] "
         f"cost: [{tr['cost']}] "
-        f"proceeds: [{tr['proceeds']}] "
-        f"pnl_dollar: [{tr['pnl_dollar']}] "
-        f"pnl_pct: [{tr['pnl_pct']}] "
-        f"is_winner: [{'TRUE' if tr['is_winner'] else 'FALSE'}]\n\n"
+        f"proceeds: [{tr['proceeds']}]\n"
     )
+
+    stock_pnl = tr['pnl_dollar']
+    opt_pnl   = tr.get('_opt_pnl')
+
+    if opt_pnl is not None:
+        combined     = round(stock_pnl + opt_pnl, 2)
+        cost         = tr['cost']
+        combined_pct = round(combined / cost * 100 if cost else 0.0, 4)
+        fh.write(
+            f"stock_sub_total: [{stock_pnl}]  "
+            f"covered_call_sub_total: [{opt_pnl}]  "
+            f"pnl_total: [{combined}]  pnl_pct: [{combined_pct}]  "
+            f"is_winner: [{'TRUE' if combined > 0 else 'FALSE'}]\n\n"
+        )
+    else:
+        fh.write(
+            f"pnl_dollar: [{stock_pnl}] "
+            f"pnl_pct: [{tr['pnl_pct']}] "
+            f"is_winner: [{'TRUE' if tr['is_winner'] else 'FALSE'}]\n\n"
+        )
 
 
 def _log_model_end(fh, seq_no, model_id, metrics):
@@ -894,6 +928,7 @@ def run_combo(
                             pre_stop_evals = cc_trigger.get('_evals', [])
                             cc_evals       = stock_leg.pop('_evals', [])
                             stock_leg['_cc_candidates'] = cc_candidates
+                            stock_leg['_opt_pnl']       = opt_leg['pnl_dollar']
                             positions.append({
                                 'combined_pnl': combined_pnl,
                                 'entry_price':  entry_price,
@@ -1143,6 +1178,7 @@ def main():
                 tr.pop('_evals',         None)
                 tr.pop('_cc_evals',      None)
                 tr.pop('_cc_candidates', None)
+                tr.pop('_opt_pnl',       None)
             all_trades.extend(trades)
 
     print(f"\n[output]  Log    -> {log_path}")

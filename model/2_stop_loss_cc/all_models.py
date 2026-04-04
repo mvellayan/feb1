@@ -176,6 +176,7 @@ def run_all_models(
             tr.pop('_evals',         None)
             tr.pop('_cc_evals',      None)
             tr.pop('_cc_candidates', None)
+            tr.pop('_opt_pnl',       None)
         all_trades.extend(model_trades)
 
         if model_id % 100 == 0 or model_id == n_combos:
