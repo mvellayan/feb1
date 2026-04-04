@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 
-REPORTS_DIR = Path(__file__).parent.parent / 'reports'
+REPORTS_DIR = Path(__file__).parent / 'reports'
 PF_CAP      = 10.0   # cap profit_factor before averaging (suppress inf)
 MIN_BATCHES = 5      # minimum run appearances to be included in rankings
 TOP_N       = 20     # rows shown in each report section

@@ -45,8 +45,8 @@ import pandas as pd
 
 _HERE   = Path(__file__).parent
 _MODEL1 = _HERE.parent / '1_tech_indicators_sock_trade'
-sys.path.insert(0, str(_HERE))
-sys.path.insert(0, str(_MODEL1))
+sys.path.insert(0, str(_MODEL1))  # utils/signals from model 1
+sys.path.insert(0, str(_HERE))    # single_model from model 2 (takes precedence)
 
 import single_model as S
 from utils import (
@@ -144,10 +144,17 @@ def run_all_models(
     for model_id, (t, m, v, vol) in enumerate(combos, 1):
         indicators = {'trend': t, 'momentum': m, 'volatility': v, 'volume': vol}
 
-        metrics, raw_trades = S.run_combo(
-            df, sample_idx, day_dict, day_pos_map, indicators,
-            capture_evals=(log_fh is not None),
-        )
+        try:
+            metrics, raw_trades = S.run_combo(
+                df, sample_idx, day_dict, day_pos_map, indicators,
+                capture_evals=(log_fh is not None),
+            )
+        except Exception as exc:
+            err_msg = f"[{seq_no}|M{model_id}] ERROR in run_combo({t},{m},{v},{vol}): {exc}"
+            print(err_msg)
+            if log_fh is not None:
+                log_fh.write(f"\n{err_msg}\n")
+            continue
 
         summary_rows.append({
             'batch_no': seq_no, 'model_id': model_id,
@@ -157,7 +164,7 @@ def run_all_models(
 
         model_trades = [{'batch_no': seq_no, 'model_no': model_id, **tr} for tr in raw_trades]
 
-        # Log only the stock leg rows (option leg is supplementary)
+        # Log stock-leg rows (which carry all CC details); option leg is supplementary
         stock_trades = [tr for tr in model_trades if tr.get('leg') == 'stock']
         if stock_trades and log_fh is not None:
             S._log_model_start(log_fh, seq_no, model_id, t, m, v, vol)
@@ -166,8 +173,9 @@ def run_all_models(
             S._log_model_end(log_fh, seq_no, model_id, metrics)
 
         for tr in model_trades:
-            tr.pop('_evals',    None)
-            tr.pop('_cc_evals', None)
+            tr.pop('_evals',         None)
+            tr.pop('_cc_evals',      None)
+            tr.pop('_cc_candidates', None)
         all_trades.extend(model_trades)
 
         if model_id % 100 == 0 or model_id == n_combos:

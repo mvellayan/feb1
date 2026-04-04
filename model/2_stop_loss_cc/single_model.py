@@ -41,8 +41,8 @@ import pandas as pd
 _HERE   = Path(__file__).parent
 _MODEL1 = _HERE.parent / '1_tech_indicators_sock_trade'
 _BASE   = _HERE.parent.parent          # /feb1/
-sys.path.insert(0, str(_HERE))
-sys.path.insert(0, str(_MODEL1))
+sys.path.insert(0, str(_MODEL1))  # signals/utils from model 1
+sys.path.insert(0, str(_HERE))    # local modules take precedence
 
 from signals import add_buy_signals, add_sell_signals
 from utils   import PF_CAP, md_table
@@ -179,15 +179,17 @@ def get_option_price_at(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def find_covered_call_option(
-    trigger_date: datetime.date,
-    trigger_avg:  float,
+    trigger_date:  datetime.date,
+    trigger_avg:   float,
+    strike_offset: float = 2.0,
 ) -> dict | None:
     """
     Find a call option contract matching:
       - call_put = 'C'
-      - strike ≤ trigger_avg − 2.0  (at or below $2 under current WAP)
+      - strike == floor(trigger_avg - strike_offset) rounded to nearest $0.50 or $1.00
+        (uses the highest strike that is ≤ trigger_avg − strike_offset)
       - expiry = nearest Friday on or after trigger_date, ≤ CC_MAX_EXPIRY_DAYS away
-    Returns the highest eligible strike (closest to trigger_avg − 2.0), or None.
+    Returns the matching contract row as a dict, or None.
     """
     option_index = load_option_index()
 
@@ -199,7 +201,7 @@ def find_covered_call_option(
         return None
 
     expiry_int = int(friday.strftime('%y%m%d'))
-    max_strike = trigger_avg - 2.0
+    max_strike = trigger_avg - strike_offset
 
     cands = option_index[
         (option_index['call_put']        == 'C') &
@@ -210,6 +212,76 @@ def find_covered_call_option(
         return None
 
     return cands.loc[cands['strike_price'].idxmax()].to_dict()
+
+
+def find_best_covered_call(
+    trigger_date: datetime.date,
+    trigger_ts:   pd.Timestamp,
+    trigger_avg:  float,
+    entry_price:  float,
+) -> tuple[dict, pd.DataFrame, list] | tuple[None, None, list]:
+    """
+    Evaluate covered call candidates with strike offsets $1–$5 ITM.
+    For each offset, locate the contract and retrieve its current premium.
+    Assuming the call expires ITM, compute:
+        itm_pnl = (strike - entry_price) * 100 + premium * 100 - 2 * COMMISSION
+    Return (best_contract, best_option_df, candidates) where candidates is a list of
+    dicts with keys: offset, strike, symbol, premium, itm_pnl, chosen.
+    On failure returns (None, None, candidates).
+    """
+    best_contract:  dict | None           = None
+    best_option_df: pd.DataFrame | None   = None
+    best_pnl:       float                 = float('-inf')
+    candidates:     list                  = []
+
+    seen_strikes: set[float] = set()
+
+    for offset in (1.0, 2.0, 3.0, 4.0, 5.0):
+        contract = find_covered_call_option(trigger_date, trigger_avg, strike_offset=offset)
+        if contract is None:
+            candidates.append({'offset': offset, 'strike': None, 'symbol': None,
+                                'premium': None, 'itm_pnl': None, 'chosen': False,
+                                'skip_reason': 'no contract'})
+            continue
+        strike = float(contract['strike_price'])
+        if strike in seen_strikes:
+            candidates.append({'offset': offset, 'strike': strike,
+                                'symbol': contract.get('localSymbol', ''),
+                                'premium': None, 'itm_pnl': None, 'chosen': False,
+                                'skip_reason': 'duplicate strike'})
+            continue
+        seen_strikes.add(strike)
+
+        option_df = load_option_data(contract)
+        premium   = get_option_price_at(option_df, trigger_ts, 'avg_bid')
+        if premium is None:
+            candidates.append({'offset': offset, 'strike': strike,
+                                'symbol': contract.get('localSymbol', ''),
+                                'premium': None, 'itm_pnl': None, 'chosen': False,
+                                'skip_reason': 'no premium data'})
+            continue
+
+        itm_pnl = (strike - entry_price) * 100 + premium * 100 - 2 * COMMISSION
+        candidates.append({'offset': offset, 'strike': strike,
+                            'symbol': contract.get('localSymbol', ''),
+                            'premium': round(premium, 4),
+                            'itm_pnl': round(itm_pnl, 2),
+                            'chosen': False, 'skip_reason': None})
+
+        if itm_pnl > best_pnl:
+            best_pnl       = itm_pnl
+            best_contract  = contract
+            best_option_df = option_df
+
+    # Mark the chosen candidate
+    if best_contract is not None:
+        best_strike = float(best_contract['strike_price'])
+        for c in candidates:
+            if c['strike'] == best_strike and c['skip_reason'] is None and not c['chosen']:
+                c['chosen'] = True
+                break
+
+    return best_contract, best_option_df, candidates
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -246,10 +318,8 @@ def compute_bracket(entry_avg: float, atr: float):
     return round(stop, 4), round(target, 4)
 
 
-def compute_shares(entry_price: float) -> int:
-    if entry_price <= 0:
-        return 0
-    return int(TRADE_CAPITAL / entry_price)
+def compute_shares(entry_price: float) -> int:  # noqa: ARG001
+    return 100
 
 
 def simulate_stock_trade(
@@ -556,7 +626,19 @@ def _log_trade(fh, tr):
         fh.write("\n")
 
     # ── Phase 2: covered call (only when CC was opened) ───────────────────────
-    cc_evals = tr.get('_cc_evals', [])
+    cc_evals     = tr.get('_cc_evals', [])
+    cc_candidates = tr.get('_cc_candidates', [])
+    if cc_candidates:
+        fh.write("cc_candidates considered:\n")
+        fh.write("    offset  strike      symbol                  premium  itm_pnl  chosen\n")
+        for c in cc_candidates:
+            strike  = f"{c['strike']:.2f}"   if c['strike']  is not None else 'n/a'
+            premium = f"{c['premium']:.4f}"  if c['premium'] is not None else 'n/a'
+            itm_pnl = f"{c['itm_pnl']:.2f}"  if c['itm_pnl'] is not None else 'n/a'
+            symbol  = str(c.get('symbol') or c.get('skip_reason') or '')
+            chosen  = '<<< chosen' if c['chosen'] else ''
+            fh.write(f"    ${c['offset']:.0f}     {strike:<10}  {symbol:<24}  {premium:<7}  {itm_pnl:<8}  {chosen}\n")
+        fh.write("\n")
     if tr.get('cc_open_price'):
         fh.write(
             f"cc_open: [{tr['cc_open_time']}] "
@@ -782,55 +864,59 @@ def run_combo(
 
         # ── Covered call pivot when stop fires ────────────────────────────────
         if cc_trigger is not None:
-            trigger_date = pd.Timestamp(cc_trigger['trigger_time']).date()
-            contract     = find_covered_call_option(trigger_date, cc_trigger['trigger_avg'])
+            trigger_ts   = pd.Timestamp(cc_trigger['trigger_time'])
+            trigger_date = trigger_ts.date()
+            contract, option_df, cc_candidates = find_best_covered_call(
+                trigger_date, trigger_ts, cc_trigger['trigger_avg'], entry_price,
+            )
 
-            if contract is not None:
-                option_df = load_option_data(contract)
-                if option_df is not None:
-                    # Build stock slice from trigger date through Friday
-                    hit = df.index[df['date'] == pd.Timestamp(cc_trigger['trigger_time'])]
-                    if len(hit) > 0:
-                        trigger_global = int(hit[0])
-                        df_eow, trigger_iloc_eow = _build_eow_context(df, trigger_global)
-                        if df_eow is not None:
-                            stock_leg, opt_leg = simulate_covered_call(
-                                df_eow, trigger_iloc_eow, option_df, contract,
-                                entry_price, cc_trigger['bars_held'], shares, capture_evals,
-                            )
-                            if stock_leg is not None:
-                                trade_no += 1
-                                combined_pnl = stock_leg['pnl_dollar'] + opt_leg['pnl_dollar']
-                                base = {
-                                    'trade_no':   trade_no,
-                                    'trade_date': str(trade_date),
-                                    **{cat: indicators.get(cat, '')
-                                       for cat in ['trend', 'momentum', 'volatility', 'volume']},
-                                    **entry_snapshot,
-                                }
-                                pre_stop_evals = cc_trigger.get('_evals', [])
-                                cc_evals       = stock_leg.pop('_evals', [])
-                                positions.append({
-                                    'combined_pnl': combined_pnl,
-                                    'entry_price':  entry_price,
-                                    'exit_price':   stock_leg['exit_price'],
-                                    'bars_held':    stock_leg['bars_held'],
-                                    'is_winner':    combined_pnl > 0,
-                                    'entry_time':   str(row['date']),
-                                })
-                                trades.append({
-                                    **base, 'leg': 'stock', **stock_leg,
-                                    '_evals': pre_stop_evals, '_cc_evals': cc_evals,
-                                })
-                                trades.append({**base, 'leg': 'option', **opt_leg})
-                                continue
+            if contract is not None and option_df is not None:
+                # Build stock slice from trigger date through Friday
+                hit = df.index[df['date'] == pd.Timestamp(cc_trigger['trigger_time'])]
+                if len(hit) > 0:
+                    trigger_global = int(hit[0])
+                    df_eow, trigger_iloc_eow = _build_eow_context(df, trigger_global)
+                    if df_eow is not None:
+                        stock_leg, opt_leg = simulate_covered_call(
+                            df_eow, trigger_iloc_eow, option_df, contract,
+                            entry_price, cc_trigger['bars_held'], shares, capture_evals,
+                        )
+                        if stock_leg is not None:
+                            trade_no += 1
+                            combined_pnl = stock_leg['pnl_dollar'] + opt_leg['pnl_dollar']
+                            base = {
+                                'trade_no':   trade_no,
+                                'trade_date': str(trade_date),
+                                **{cat: indicators.get(cat, '')
+                                   for cat in ['trend', 'momentum', 'volatility', 'volume']},
+                                **entry_snapshot,
+                            }
+                            pre_stop_evals = cc_trigger.get('_evals', [])
+                            cc_evals       = stock_leg.pop('_evals', [])
+                            stock_leg['_cc_candidates'] = cc_candidates
+                            positions.append({
+                                'combined_pnl': combined_pnl,
+                                'entry_price':  entry_price,
+                                'exit_price':   stock_leg['exit_price'],
+                                'bars_held':    stock_leg['bars_held'],
+                                'is_winner':    combined_pnl > 0,
+                                'entry_time':   str(row['date']),
+                            })
+                            trades.append({
+                                **base, 'leg': 'stock', **stock_leg,
+                                '_evals': pre_stop_evals, '_cc_evals': cc_evals,
+                            })
+                            trades.append({**base, 'leg': 'option', **opt_leg})
+                            continue
 
             # Fallback: no contract or data — use stop_loss exit
             stock_result = _fallback_stop_result(cc_trigger, entry_price, shares)
+            stock_result['_cc_candidates'] = cc_candidates
 
         # ── Normal (eod_forced or fallback stop_loss) ─────────────────────────
         trade_no += 1
-        evals = stock_result.pop('_evals', [])
+        evals        = stock_result.pop('_evals', [])
+        cc_cands_fb  = stock_result.pop('_cc_candidates', [])
         combined_pnl = stock_result['pnl_dollar']
         positions.append({
             'combined_pnl': combined_pnl,
@@ -847,7 +933,10 @@ def run_combo(
                for cat in ['trend', 'momentum', 'volatility', 'volume']},
             **entry_snapshot,
         }
-        trades.append({**base, 'leg': 'stock', **stock_result, '_evals': evals})
+        trades.append({
+            **base, 'leg': 'stock', **stock_result,
+            '_evals': evals, '_cc_candidates': cc_cands_fb,
+        })
 
     if not positions:
         return _empty_metrics('no_signals'), []
@@ -1029,10 +1118,16 @@ def main():
                 end='  ',
             )
 
-            summary, trades = run_single(
-                df_signals, indicators, window_start, window_end, seed, run_no,
-                capture_evals=True,
-            )
+            try:
+                summary, trades = run_single(
+                    df_signals, indicators, window_start, window_end, seed, run_no,
+                    capture_evals=True,
+                )
+            except Exception as exc:
+                err_msg = f"ERROR in run_single run_no={run_no}: {exc}"
+                print(err_msg)
+                log_fh.write(f"\n{err_msg}\n")
+                continue
 
             print(f"trades={summary['n_trades']:<4}  pnl=${summary['total_pnl']:>8,.2f}  [{summary['status']}]")
             all_summaries.append(summary)
@@ -1045,8 +1140,9 @@ def main():
                 _log_model_end(log_fh, run_no, '-', summary)
 
             for tr in trades:
-                tr.pop('_evals',    None)
-                tr.pop('_cc_evals', None)
+                tr.pop('_evals',         None)
+                tr.pop('_cc_evals',      None)
+                tr.pop('_cc_candidates', None)
             all_trades.extend(trades)
 
     print(f"\n[output]  Log    -> {log_path}")

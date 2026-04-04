@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import secrets
 import sys
 import warnings
 from itertools import product
@@ -399,8 +400,14 @@ if __name__ == '__main__':
         '--end-of-week-exit', action='store_true', default=False,
         help='Hold positions through Friday 4 PM instead of closing at end of day',
     )
+    _parser.add_argument(
+        '--seed', type=int, default=None,
+        help='Master RNG seed (omit for a fresh random seed each run)',
+    )
     _args = _parser.parse_args()
     END_OF_WEEK_EXIT = _args.end_of_week_exit
+    RANDOM_SEED = _args.seed if _args.seed is not None else secrets.randbelow(2**32)
+    print(f"[main]  Master seed: {RANDOM_SEED}")
 
     DATA_FIRST  = datetime.date(2023, 1, 1)
     DATA_LAST   = datetime.date(2026, 2, 28)

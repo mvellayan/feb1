@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import random
+import secrets
 import sys
 import warnings
 from pathlib import Path
@@ -651,7 +652,7 @@ def _empty_summary(run_no, indicators, window_start, window_end, seed, status) -
 # STANDALONE CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_args() -> tuple[dict[str, str], bool]:
+def parse_args() -> tuple[dict[str, str], bool, int]:
     parser = argparse.ArgumentParser(
         description='Run a single indicator combination across 100 time windows.'
     )
@@ -663,6 +664,10 @@ def parse_args() -> tuple[dict[str, str], bool]:
         '--end-of-week-exit', action='store_true', default=False,
         help='Hold positions through Friday 4 PM instead of closing at end of day',
     )
+    parser.add_argument(
+        '--seed', type=int, default=None,
+        help='Meta RNG seed (omit for a fresh random seed each run)',
+    )
 
     args = parser.parse_args()
     indicators = {
@@ -671,7 +676,8 @@ def parse_args() -> tuple[dict[str, str], bool]:
         'volatility': args.volatility.strip().lower(),
         'volume':     args.volume.strip().lower(),
     }
-    return indicators, args.end_of_week_exit
+    seed = args.seed if args.seed is not None else secrets.randbelow(2**32)
+    return indicators, args.end_of_week_exit, seed
 
 
 def combo_label(indicators: dict[str, str]) -> str:
@@ -679,15 +685,15 @@ def combo_label(indicators: dict[str, str]) -> str:
     return '_'.join(v for v in indicators.values() if v) or 'none'
 
 
-def generate_test_runs(n: int = N_RUNS) -> list[tuple[str, str, int]]:
+def generate_test_runs(n: int = N_RUNS, meta_seed: int = META_SEED) -> list[tuple[str, str, int]]:
     """
     Returns n (window_start, window_end, seed) tuples, sorted chronologically.
-    Windows and seeds are both derived from META_SEED for reproducibility.
+    Windows and seeds are both derived from meta_seed for reproducibility.
     """
     max_start  = DATA_LAST - datetime.timedelta(days=WINDOW_DAYS)
     total_days = (max_start - DATA_FIRST).days
 
-    rng     = np.random.default_rng(META_SEED)
+    rng     = np.random.default_rng(meta_seed)
     offsets = rng.choice(total_days, size=n, replace=False)
     seeds   = rng.integers(1, 10_000, size=n)
 
@@ -733,7 +739,7 @@ def print_aggregate(runs_df: pd.DataFrame, label: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    indicators, end_of_week_exit = parse_args()
+    indicators, end_of_week_exit, meta_seed = parse_args()
     label      = combo_label(indicators)
     active     = {k: v for k, v in indicators.items() if v}
 
@@ -757,13 +763,14 @@ def main():
     print(f"  Indicators : {indicators}")
     print(f"  Active cats: {list(active.keys())}")
     print(f"  Exit mode  : {exit_mode}")
+    print(f"  Meta seed  : {meta_seed}")
     print(f"  Runs       : {N_RUNS}  (window={WINDOW_DAYS} cal days each)")
     print(f"  Data range : {DATA_FIRST} -> {DATA_LAST}")
     print(f"  Output dir : {run_dir}")
     print(f"{'='*60}\n")
 
     df_signals = load_or_build_signals()
-    test_runs  = generate_test_runs(N_RUNS)
+    test_runs  = generate_test_runs(N_RUNS, meta_seed=meta_seed)
 
     all_summaries = []
     all_trades    = []
