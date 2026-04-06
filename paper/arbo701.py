@@ -263,10 +263,15 @@ class IBApp(EWrapper, EClient):
         # ── order status (updated by orderStatus callback) ───────────────────
         self.order_status : dict[int, dict] = {}  # orderId → {status, filled, avg_fill}
 
-        # ── option tick collection ────────────────────────────────────────────
+        # ── option tick collection (one-shot, for CC selection at stop trigger) ─
         self._opt_bid  : dict[int, float] = {}   # reqId → last bid
         self._opt_ask  : dict[int, float] = {}   # reqId → last ask
         self._opt_done : dict[int, threading.Event] = {}
+
+        # ── persistent CC option prices (one sub per open CC position) ─────────
+        # Keyed by the reqId used when the CC was opened.  Eliminates per-bar
+        # reqMktData/cancelMktData churn in check_cc_buybacks.
+        self._cc_prices: dict[int, dict] = {}   # reqId → {'bid': float|None, 'ask': float|None}
 
     # ── connection ─────────────────────────────────────────────────────────────
 
@@ -406,8 +411,15 @@ class IBApp(EWrapper, EClient):
                 self._current_vix = price
                 log.debug(f"[tick] VIX={price}")
 
+        elif reqId in self._cc_prices:
+            # Persistent CC option subscription (one per open position)
+            if tickType in (1, 66):    # Bid
+                self._cc_prices[reqId]['bid'] = price
+            elif tickType in (2, 67):  # Ask
+                self._cc_prices[reqId]['ask'] = price
+
         elif reqId in self._opt_done:
-            # Option quote collection for CC selection
+            # One-shot option quote (used only during CC selection at stop trigger)
             if tickType in (1, 66):
                 self._opt_bid[reqId] = price
             elif tickType in (2, 67):
@@ -688,10 +700,11 @@ _PS_COLS = [
     'atr_at_entry', 'rsi_at_entry', 'adx_at_entry', 'vwap_at_entry',
     'high_water',             # WAP high-water mark — used to ratchet trailing stop
     'current_trailing_stop',  # updated every bar
-    'pending_order_id',       # set when a limit buy is waiting to fill
+    'pending_order_id',       # set when a market buy is waiting to fill
     # Covered call fields (populated when CC is opened)
     'cc_symbol', 'cc_local_symbol', 'cc_strike', 'cc_expiry',
     'cc_open_price', 'cc_open_time',
+    'cc_mktdata_req_id',      # reqId of the persistent CC option subscription
 ]
 
 # Columns for transaction.csv
@@ -930,6 +943,7 @@ def sync_on_startup(app: IBApp) -> pd.DataFrame:
     if not ps.empty:
         valid = ps['local_symbol'].isin(set(ib_stk.keys()))
         for _, row in ps[~valid].iterrows():
+            _cancel_cc_sub(app, row)
             log.info(f"[startup] Removing stale support row model={row['model_no']} "
                      f"sym={row['local_symbol']} (no IB position)")
         ps = ps[valid].reset_index(drop=True)
@@ -1141,6 +1155,20 @@ def update_trailing_stops(ps: pd.DataFrame, bar_wap: float) -> pd.DataFrame:
     return ps
 
 
+# ── CC subscription helpers ───────────────────────────────────────────────────
+
+def _cancel_cc_sub(app: IBApp, row) -> None:
+    """Cancel the persistent market data subscription for a covered call position."""
+    try:
+        rid = int(float(row.get('cc_mktdata_req_id') or 0))
+    except (ValueError, TypeError):
+        return
+    if rid > 0:
+        app.cancelMktData(rid)
+        app._cc_prices.pop(rid, None)
+        log.debug(f"[cc sub] cancelled reqId={rid} model={row.get('model_no','?')}")
+
+
 # ── step 4: check stop losses → covered call pivot ────────────────────────────
 
 def check_stop_losses(
@@ -1178,16 +1206,23 @@ def check_stop_losses(
             oid = app.next_order_id()
             app.placeOrder(oid, best_cc['contract'],
                            _limit_order('SELL', 1, _mid(best_cc['bid'], best_cc['ask'])))
+
+            # Subscribe to persistent option price stream (replaces per-bar get_option_quote)
+            cc_rid = app.next_req_id()
+            app._cc_prices[cc_rid] = {'bid': None, 'ask': None}
+            app.reqMktData(cc_rid, best_cc['contract'], '', False, False, [])
+
             log.info(f"[CC open] model={mn}  strike={best_cc['strike']}  "
                      f"expiry={best_cc['expiry'].isoformat()}  "
-                     f"premium={best_cc['premium']:.4f}  oid={oid}")
+                     f"premium={best_cc['premium']:.4f}  oid={oid}  cc_rid={cc_rid}")
 
-            ps.at[i, 'cc_symbol']       = SYMBOL
-            ps.at[i, 'cc_local_symbol'] = best_cc['local_symbol']
-            ps.at[i, 'cc_strike']       = best_cc['strike']
-            ps.at[i, 'cc_expiry']       = best_cc['expiry'].isoformat()
-            ps.at[i, 'cc_open_price']   = best_cc['premium']
-            ps.at[i, 'cc_open_time']    = bar_dt.isoformat()
+            ps.at[i, 'cc_symbol']          = SYMBOL
+            ps.at[i, 'cc_local_symbol']    = best_cc['local_symbol']
+            ps.at[i, 'cc_strike']          = best_cc['strike']
+            ps.at[i, 'cc_expiry']          = best_cc['expiry'].isoformat()
+            ps.at[i, 'cc_open_price']      = best_cc['premium']
+            ps.at[i, 'cc_open_time']       = bar_dt.isoformat()
+            ps.at[i, 'cc_mktdata_req_id']  = cc_rid
 
             _log_txn({
                 'timestamp': bar_dt.isoformat(),   'model_no': mn,
@@ -1271,7 +1306,8 @@ def check_cc_buybacks(
     bar_dt: datetime,
 ) -> pd.DataFrame:
     """
-    For positions with an open covered call: query the live option ask.
+    For positions with an open covered call: read the live option ask from the
+    persistent _cc_prices subscription (no per-bar reqMktData calls).
     If ask < CC_BUYBACK_THRESHOLD, buy back the call and sell the stock.
     """
     bar_bid = float(bar['avg_bid'])
@@ -1285,19 +1321,17 @@ def check_cc_buybacks(
 
         cc_sym = str(row['cc_local_symbol'])
         try:
-            expiry_date = date.fromisoformat(str(row['cc_expiry']))
+            cc_rid = int(float(row.get('cc_mktdata_req_id') or 0))
         except (ValueError, TypeError):
-            continue
+            cc_rid = 0
 
-        # Re-build the option contract from position_support fields
-        cc_contract = _option_contract(
-            float(row['cc_strike']), expiry_date, right='C'
-        )
-        cc_contract.localSymbol = cc_sym
+        # Read bid/ask from the persistent subscription (no new reqMktData needed)
+        prices = app._cc_prices.get(cc_rid, {}) if cc_rid > 0 else {}
+        bid = prices.get('bid')
+        ask = prices.get('ask')
 
-        bid, ask = app.get_option_quote(cc_contract)
         if ask is None:
-            log.debug(f"[cc monitor] model={row['model_no']}  {cc_sym}  no quote")
+            log.debug(f"[cc monitor] model={row['model_no']}  {cc_sym}  no ask yet")
             continue
 
         log.debug(f"[cc monitor] model={row['model_no']}  {cc_sym}  ask={ask:.4f}")
@@ -1306,12 +1340,26 @@ def check_cc_buybacks(
             continue
 
         # ── Buyback triggered ──────────────────────────────────────────────
-        mn   = row['model_no']
+        mn = row['model_no']
         log.info(f"[CC buyback] model={mn}  {cc_sym}  ask={ask:.4f} < threshold")
 
-        # Buy back the call at mid-price (bid = None is possible; fall back to ask)
-        cc_mid  = _mid(bid, ask) if bid else ask
-        cc_oid  = app.next_order_id()
+        try:
+            expiry_date = date.fromisoformat(str(row['cc_expiry']))
+        except (ValueError, TypeError):
+            expiry_date = None
+
+        cc_contract = _option_contract(
+            float(row['cc_strike']),
+            expiry_date or date.today(),
+            right='C',
+        )
+        cc_contract.localSymbol = cc_sym
+
+        # Cancel persistent subscription before closing the position
+        _cancel_cc_sub(app, row)
+
+        cc_mid = _mid(bid, ask) if bid else ask
+        cc_oid = app.next_order_id()
         app.placeOrder(cc_oid, cc_contract, _limit_order('BUY', 1, cc_mid))
         _log_txn({
             'timestamp': bar_dt.isoformat(), 'model_no': mn,
@@ -1322,7 +1370,6 @@ def check_cc_buybacks(
             'reason': f'cc_buyback_ask_{ask:.4f}',
         })
 
-        # Sell stock at mid-price
         stk_mid = _mid(bar_bid, bar_ask)
         stk_oid = app.next_order_id()
         app.placeOrder(stk_oid, _stk_contract(), _limit_order('SELL', SHARES, stk_mid))
@@ -1402,6 +1449,7 @@ def check_cc_expiry(
                 'price': bar_bid,                'order_id': oid,
                 'reason': 'cc_expired_otm',
             })
+        _cancel_cc_sub(app, row)
         rows_to_drop.append(i)
 
     if rows_to_drop:
