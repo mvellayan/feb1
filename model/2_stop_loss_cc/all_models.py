@@ -423,15 +423,26 @@ if __name__ == '__main__':
         '--workers', type=int, default=max(1, (os.cpu_count() or 1) - 1),
         help='Number of parallel worker processes (default: cpu_count - 1)',
     )
+    _parser.add_argument(
+        '--data-first', type=str, default='2023-01-01',
+        help='Start of data range (YYYY-MM-DD, default: 2023-01-01)',
+    )
+    _parser.add_argument(
+        '--data-last', type=str, default='2026-02-28',
+        help='End of data range (YYYY-MM-DD, default: 2026-02-28)',
+    )
+    _parser.add_argument(
+        '--window-days', type=int, default=14,
+        help='Calendar days per test window (default: 14)',
+    )
     _args = _parser.parse_args()
     RANDOM_SEED = _args.seed if _args.seed is not None else secrets.randbelow(2**32)
     N_WORKERS   = _args.workers
+    DATA_FIRST  = datetime.date.fromisoformat(_args.data_first)
+    DATA_LAST   = datetime.date.fromisoformat(_args.data_last)
+    WINDOW_DAYS = _args.window_days
     print(f"[main]  Master seed : {RANDOM_SEED}")
     print(f"[main]  Workers     : {N_WORKERS}")
-
-    DATA_FIRST  = datetime.date(2023, 1, 1)
-    DATA_LAST   = datetime.date(2026, 2, 28)
-    WINDOW_DAYS = 14
 
     run_ts  = datetime.datetime.now().strftime('%m%d%H%M')
     run_dir = REPORTS_DIR / run_ts

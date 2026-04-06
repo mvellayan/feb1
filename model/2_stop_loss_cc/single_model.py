@@ -64,15 +64,17 @@ TRADE_CAPITAL        = 10_000.0
 COMMISSION           = 2.00
 ATR_STOP_MULT        = 1.5
 ATR_TARGET_RR        = 2.0
-CC_BUYBACK_THRESHOLD = 0.50    # buy back the short call if ask drops below this
-CC_MAX_EXPIRY_DAYS   = 4       # max calendar days to Friday expiration
-MAX_STRIKE_GAP       = 2.0     # max $ distance between found strike and target strike
+CC_BUYBACK_THRESHOLD  = 0.50   # buy back the short call if ask drops below this
+CC_MAX_EXPIRY_DAYS    = 4      # max calendar days to Friday expiration
+MAX_STRIKE_GAP        = 2.0    # max $ distance between found strike and target strike
+MAX_QUOTE_AGE_MINUTES = 30     # max minutes between last option quote and query time
+EXPIRY_QUOTE_MIN_HOUR = 15     # expiry-day quote must exist at or after this hour (3pm)
 
 # ── standalone run constants ───────────────────────────────────────────────────
 N_RUNS      = 100
-DATA_FIRST  = datetime.date(2023, 1, 1)
-DATA_LAST   = datetime.date(2026, 2, 28)
-WINDOW_DAYS = 14
+DATA_FIRST  = datetime.date(2023, 1, 1)   # overridable via --data-first
+DATA_LAST   = datetime.date(2026, 2, 28)  # overridable via --data-last
+WINDOW_DAYS = 14                           # overridable via --window-days
 META_SEED   = 42
 
 
@@ -161,18 +163,37 @@ def load_option_data(contract: dict) -> pd.DataFrame | None:
 
 
 def get_option_price_at(
-    option_df: pd.DataFrame | None,
-    ts:        pd.Timestamp,
-    col:       str,
+    option_df:       pd.DataFrame | None,
+    ts:              pd.Timestamp,
+    col:             str,
+    max_age_minutes: int | None = None,
 ) -> float | None:
-    """Return the most recent value of `col` at or before `ts`. None if unavailable."""
+    """Return the most recent value of `col` at or before `ts`.
+    If max_age_minutes is set, returns None if that quote is older than
+    max_age_minutes minutes (stale data guard)."""
     if option_df is None or option_df.empty:
         return None
     mask = option_df['date'] <= ts
     if not mask.any():
         return None
-    val = float(option_df.loc[mask, col].iloc[-1])
+    row = option_df.loc[mask].iloc[-1]
+    if max_age_minutes is not None:
+        age = (ts - pd.Timestamp(row['date'])).total_seconds() / 60
+        if age > max_age_minutes:
+            return None
+    val = float(row[col])
     return val if val > 0 else None
+
+
+def _has_expiry_quote(option_df: pd.DataFrame | None, expiry_date: datetime.date) -> bool:
+    """True if option_df has at least one quote on the expiry date at or after
+    EXPIRY_QUOTE_MIN_HOUR (3pm).  Options with no late-day quote on their
+    expiration Friday are treated as having insufficient data."""
+    if option_df is None or option_df.empty:
+        return False
+    threshold = pd.Timestamp(expiry_date) + pd.Timedelta(hours=EXPIRY_QUOTE_MIN_HOUR)
+    end       = pd.Timestamp(expiry_date) + pd.Timedelta(days=1)
+    return bool(((option_df['date'] >= threshold) & (option_df['date'] < end)).any())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -243,16 +264,18 @@ def find_best_covered_call(
 
     seen_strikes: set[float] = set()
 
+    # Compute expiry Friday once — shared by all offsets and the None-fallback path
+    _dow        = trigger_date.weekday()
+    _days_ahead = (4 - _dow) % 7
+    friday      = trigger_date + datetime.timedelta(days=_days_ahead)
+    expiry_int  = int(friday.strftime('%y%m%d'))
+
     for offset in (1.0, 2.0, 3.0, 4.0, 5.0):
         contract = find_covered_call_option(trigger_date, trigger_avg, strike_offset=offset)
         if contract is None:
             # distinguish "no contract at all" from "strike too far"
             # re-check what the best available strike was (without the gap filter)
             option_index = load_option_index()
-            dow        = trigger_date.weekday()
-            days_ahead = (4 - dow) % 7
-            friday     = trigger_date + datetime.timedelta(days=days_ahead)
-            expiry_int = int(friday.strftime('%y%m%d'))
             max_strike = trigger_avg - offset
             raw_cands  = option_index[
                 (option_index['call_put']        == 'C') &
@@ -279,12 +302,24 @@ def find_best_covered_call(
         seen_strikes.add(strike)
 
         option_df = load_option_data(contract)
-        premium   = get_option_price_at(option_df, trigger_ts, 'avg_bid')
+
+        # Require a quote on the expiration Friday at or after EXPIRY_QUOTE_MIN_HOUR.
+        # Without late-day expiry data we cannot reliably track the option through close.
+        if not _has_expiry_quote(option_df, friday):
+            candidates.append({'offset': offset, 'strike': strike,
+                                'symbol': contract.get('localSymbol', ''),
+                                'premium': None, 'itm_pnl': None, 'chosen': False,
+                                'skip_reason': 'no expiry quote'})
+            continue
+
+        # Require a fresh quote at open time (not a stale price from hours earlier).
+        premium = get_option_price_at(option_df, trigger_ts, 'avg_bid',
+                                      max_age_minutes=MAX_QUOTE_AGE_MINUTES)
         if premium is None:
             candidates.append({'offset': offset, 'strike': strike,
                                 'symbol': contract.get('localSymbol', ''),
                                 'premium': None, 'itm_pnl': None, 'chosen': False,
-                                'skip_reason': 'no premium data'})
+                                'skip_reason': 'no open quote'})
             continue
 
         itm_pnl = (strike - entry_price) * 100 + premium * 100 - 2 * COMMISSION
@@ -504,7 +539,8 @@ def simulate_covered_call(
     trigger_bar = df_eow.iloc[trigger_iloc]
     trigger_ts  = pd.Timestamp(trigger_bar['date'])
 
-    cc_open_price = get_option_price_at(option_df, trigger_ts, 'avg_bid')
+    cc_open_price = get_option_price_at(option_df, trigger_ts, 'avg_bid',
+                                        max_age_minutes=MAX_QUOTE_AGE_MINUTES)
     if cc_open_price is None:
         return None, None
 
@@ -523,10 +559,12 @@ def simulate_covered_call(
         cc_bars += 1
 
         if capture_evals:
-            opt_ask_eval = get_option_price_at(option_df, bar_time, 'avg_ask') or 0.0
+            opt_ask_eval = get_option_price_at(option_df, bar_time, 'avg_ask',
+                                               max_age_minutes=MAX_QUOTE_AGE_MINUTES) or 0.0
             evals.append((str(bar['date']), round(float(bar['average']), 4), round(opt_ask_eval, 4)))
 
-        opt_ask = get_option_price_at(option_df, bar_time, 'avg_ask')
+        opt_ask = get_option_price_at(option_df, bar_time, 'avg_ask',
+                                      max_age_minutes=MAX_QUOTE_AGE_MINUTES)
         if opt_ask is not None and opt_ask < CC_BUYBACK_THRESHOLD:
             cc_close_price  = opt_ask
             cc_close_reason = 'buyback'
@@ -1059,7 +1097,7 @@ def _empty_summary(run_no, indicators, window_start, window_end, seed, status) -
 # STANDALONE CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_args() -> tuple[dict[str, str], int]:
+def parse_args() -> tuple[dict[str, str], int, datetime.date, datetime.date, int]:
     parser = argparse.ArgumentParser(
         description='Run a single indicator combination (CC exit model) across 100 windows.'
     )
@@ -1071,6 +1109,18 @@ def parse_args() -> tuple[dict[str, str], int]:
         '--seed', type=int, default=None,
         help='Meta RNG seed (omit for a fresh random seed each run)',
     )
+    parser.add_argument(
+        '--data-first', type=str, default='2023-01-01',
+        help='Start of data range (YYYY-MM-DD, default: 2023-01-01)',
+    )
+    parser.add_argument(
+        '--data-last', type=str, default='2026-02-28',
+        help='End of data range (YYYY-MM-DD, default: 2026-02-28)',
+    )
+    parser.add_argument(
+        '--window-days', type=int, default=14,
+        help='Calendar days per test window (default: 14)',
+    )
     args = parser.parse_args()
     indicators = {
         'trend':      args.trend.strip().lower(),
@@ -1079,7 +1129,13 @@ def parse_args() -> tuple[dict[str, str], int]:
         'volume':     args.volume.strip().lower(),
     }
     seed = args.seed if args.seed is not None else secrets.randbelow(2**32)
-    return indicators, seed
+    return (
+        indicators,
+        seed,
+        datetime.date.fromisoformat(args.data_first),
+        datetime.date.fromisoformat(args.data_last),
+        args.window_days,
+    )
 
 
 def combo_label(indicators: dict[str, str]) -> str:
@@ -1131,7 +1187,8 @@ def print_aggregate(runs_df: pd.DataFrame, label: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    indicators, meta_seed = parse_args()
+    global DATA_FIRST, DATA_LAST, WINDOW_DAYS
+    indicators, meta_seed, DATA_FIRST, DATA_LAST, WINDOW_DAYS = parse_args()
     label  = combo_label(indicators)
     active = {k: v for k, v in indicators.items() if v}
 

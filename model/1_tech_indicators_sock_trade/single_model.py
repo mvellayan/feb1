@@ -66,9 +66,9 @@ END_OF_WEEK_EXIT = False           # when True: hold through Friday 4 PM instead
 
 # ── standalone run constants ───────────────────────────────────────────────────
 N_RUNS      = 100
-DATA_FIRST  = datetime.date(2023, 1, 1)
-DATA_LAST   = datetime.date(2026, 2, 28)
-WINDOW_DAYS = 14
+DATA_FIRST  = datetime.date(2023, 1, 1)   # overridable via --data-first
+DATA_LAST   = datetime.date(2026, 2, 28)  # overridable via --data-last
+WINDOW_DAYS = 14                           # overridable via --window-days
 META_SEED   = 42
 
 
@@ -670,7 +670,7 @@ def _empty_summary(run_no, indicators, window_start, window_end, seed, status) -
 # STANDALONE CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_args() -> tuple[dict[str, str], bool, int]:
+def parse_args() -> tuple[dict[str, str], bool, int, datetime.date, datetime.date, int]:
     parser = argparse.ArgumentParser(
         description='Run a single indicator combination across 100 time windows.'
     )
@@ -686,6 +686,18 @@ def parse_args() -> tuple[dict[str, str], bool, int]:
         '--seed', type=int, default=None,
         help='Meta RNG seed (omit for a fresh random seed each run)',
     )
+    parser.add_argument(
+        '--data-first', type=str, default='2023-01-01',
+        help='Start of data range (YYYY-MM-DD, default: 2023-01-01)',
+    )
+    parser.add_argument(
+        '--data-last', type=str, default='2026-02-28',
+        help='End of data range (YYYY-MM-DD, default: 2026-02-28)',
+    )
+    parser.add_argument(
+        '--window-days', type=int, default=14,
+        help='Calendar days per test window (default: 14)',
+    )
 
     args = parser.parse_args()
     indicators = {
@@ -695,7 +707,14 @@ def parse_args() -> tuple[dict[str, str], bool, int]:
         'volume':     args.volume.strip().lower(),
     }
     seed = args.seed if args.seed is not None else secrets.randbelow(2**32)
-    return indicators, args.end_of_week_exit, seed
+    return (
+        indicators,
+        args.end_of_week_exit,
+        seed,
+        datetime.date.fromisoformat(args.data_first),
+        datetime.date.fromisoformat(args.data_last),
+        args.window_days,
+    )
 
 
 def combo_label(indicators: dict[str, str]) -> str:
@@ -757,7 +776,8 @@ def print_aggregate(runs_df: pd.DataFrame, label: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    indicators, end_of_week_exit, meta_seed = parse_args()
+    global DATA_FIRST, DATA_LAST, WINDOW_DAYS
+    indicators, end_of_week_exit, meta_seed, DATA_FIRST, DATA_LAST, WINDOW_DAYS = parse_args()
     label      = combo_label(indicators)
     active     = {k: v for k, v in indicators.items() if v}
 
