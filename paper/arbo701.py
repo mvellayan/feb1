@@ -13,10 +13,10 @@ Architecture
   Main thread blocks on bar_queue, processes one completed bar per iteration.
   All state is persisted to CSV files so the program can restart seamlessly.
 
-Bar sources (three keepUpToDate streams)
-  REQ_AAPL_TRADES (1) — AAPL TRADES  → open/high/low/close/average/barCount/volume
-  REQ_AAPL_BIDASK (2) — AAPL BID_ASK → avg_bid / avg_ask / max_ask / min_bid
-  REQ_VIX_TRADES  (3) — VIX  TRADES  → vix (= bar.high)
+Bar sources (reqMktData + reqRealTimeBars — no reqHistoricalData)
+  REQ_AAPL_MKTDATA (2) — reqMktData AAPL  → bid / ask ticks (tickType 1/2)
+  REQ_VIX_MKTDATA  (3) — reqMktData VIX   → VIX last tick (tickType 4/9)
+  REQ_AAPL_RTBARS  (4) — reqRealTimeBars  → 5-sec OHLCV+WAP accumulated to 1-min
 
 Column mapping from IB BID_ASK bar  (matches 1_projection/1_process_stock_quotes.py):
   avg_bid  = bar.open   (time-avg bid)
@@ -107,20 +107,16 @@ EOD_MINUTE           = 15 * 60 + 45   # 3:45 PM expressed as minutes-since-midni
 
 COMMISSION           = 2.00   # round-trip per trade
 MAX_BARS             = 1000   # rows retained in rolling CSV files
-HISTORY_DURATION     = '5 D'  # IB lookback window on startup (covers weekends)
 CONN_TIMEOUT         = 20     # seconds to wait for TWS handshake
 OPT_QUOTE_TIMEOUT    = 5      # seconds to wait for option bid/ask ticks
 
 # ── reqId layout ──────────────────────────────────────────────────────────────
 # Live subscriptions (persistent for the session)
-REQ_AAPL_TRADES = 1   # reqHistoricalData keepUpToDate=True  → TRADES bars (bar driver)
-REQ_AAPL_MKTDATA = 2  # reqMktData streaming                 → live AAPL bid / ask ticks
-REQ_VIX_MKTDATA  = 3  # reqMktData streaming                 → live VIX last-price tick
-
-# One-time historical backfill (keepUpToDate=False, fired once on startup)
-_HIST_TRADES_REQ = 10
-_HIST_BIDASK_REQ = 11
-_HIST_VIX_REQ    = 12
+# IB paper accounts do not support reqHistoricalData (HMDS unavailable).
+# All live data comes from reqMktData ticks and reqRealTimeBars.
+REQ_AAPL_MKTDATA = 2   # reqMktData streaming  → live AAPL bid / ask ticks
+REQ_VIX_MKTDATA  = 3   # reqMktData streaming  → live VIX last-price tick
+REQ_AAPL_RTBARS  = 4   # reqRealTimeBars       → 5-sec TRADES bars (accumulated to 1-min)
 
 _DYN_REQ_START   = 100   # dynamic reqIds for option quote queries
 
@@ -228,24 +224,13 @@ class IBApp(EWrapper, EClient):
         self._dyn_req  = _DYN_REQ_START
         self._req_lock = threading.Lock()
 
-        # ── one-time historical backfill collections ─────────────────────────────
-        # Keyed by the _HIST_* reqIds (10, 11, 12), not the live-stream reqIds.
-        self._hist_bars: dict[int, list] = {
-            _HIST_TRADES_REQ: [], _HIST_BIDASK_REQ: [], _HIST_VIX_REQ: []
-        }
-        self._hist_done: dict[int, threading.Event] = {
-            _HIST_TRADES_REQ: threading.Event(),
-            _HIST_BIDASK_REQ: threading.Event(),
-            _HIST_VIX_REQ:    threading.Event(),
-        }
-
-        # ── live bar assembly ─────────────────────────────────────────────────
-        # Only the TRADES keepUpToDate stream drives bar completion.
-        # Bid/ask and VIX come from reqMktData tick subscriptions below.
-        self._live_trades_ts  : str | None  = None
-        self._live_trades_bar : object      = None
-        self._bar_lock                      = threading.Lock()
-        self.bar_queue        : queue.Queue = queue.Queue()
+        # ── 5-second real-time bar accumulator → 1-minute bar queue ─────────────
+        # reqRealTimeBars (REQ_AAPL_RTBARS) delivers 5-sec OHLCV+WAP bars.
+        # We accumulate 12 of them into each 1-minute bar, then put the
+        # completed bar on bar_queue for the main trading loop.
+        self._rtbar_acc : dict         = {}   # accumulated 5-sec state for current minute
+        self._bar_lock                 = threading.Lock()
+        self.bar_queue  : queue.Queue  = queue.Queue()
 
         # ── live tick state (from reqMktData subscriptions) ───────────────────
         self._current_bid : float | None = None   # AAPL best bid (tickType 1)
@@ -292,49 +277,81 @@ class IBApp(EWrapper, EClient):
             log.debug(f"[IB] warning reqId={reqId} {errorCode}: {errorString}")
             return
         log.error(f"[IB] error reqId={reqId} code={errorCode}: {errorString}")
-        # Unblock waiting events so callers don't hang
-        if reqId in self._hist_done:
-            self._hist_done[reqId].set()
+        # Unblock waiting option-quote events so callers don't hang
         if reqId in self._opt_done:
             self._opt_done[reqId].set()
 
-    # ── historical data (one-time backfill, keepUpToDate=False) ──────────────────
+    # ── 5-second real-time bars → 1-minute bar accumulator ──────────────────────
 
-    def historicalData(self, reqId: int, bar):
-        if reqId in self._hist_bars:
-            self._hist_bars[reqId].append(bar)
-
-    def historicalDataEnd(self, reqId: int, start: str, end: str):
-        if reqId in self._hist_done:
-            n = len(self._hist_bars.get(reqId, []))
-            log.info(f"[IB] historicalDataEnd reqId={reqId} ({n} bars)")
-            self._hist_done[reqId].set()
-
-    # ── live bar updates  (TRADES keepUpToDate=True only) ────────────────────────
-
-    def historicalDataUpdate(self, reqId: int, bar):
+    def realtimeBar(self, reqId: int, time: int, open_: float, high: float,
+                    low: float, close: float, volume: int, wap: float, count: int):
         """
-        Called when the current incomplete TRADES bar is updated by IB.
-        When the minute timestamp advances the previous bar is complete —
-        emit it immediately using the latest bid/ask/vix from reqMktData ticks.
+        Called every 5 seconds by IB for REQ_AAPL_RTBARS.
+        Accumulates 5-sec bars into 1-minute bars keyed by Unix minute boundary.
+        When the minute rolls over, emits the completed bar to bar_queue.
+        Bid/ask and VIX are snapshotted from the reqMktData tick state at emission time.
         """
-        if reqId != REQ_AAPL_TRADES:
+        if reqId != REQ_AAPL_RTBARS:
             return
-        ts = _bar_minute_key(bar.date)
+
+        minute_ts = (time // 60) * 60   # floor to minute start (Unix seconds)
+
         with self._bar_lock:
-            prev_ts  = self._live_trades_ts
-            prev_bar = self._live_trades_bar
-            if prev_ts is not None and ts != prev_ts:
-                # Previous bar is complete — emit it
-                bid = self._current_bid if self._current_bid else prev_bar.average
-                ask = self._current_ask if self._current_ask else prev_bar.average
+            acc = self._rtbar_acc
+
+            if not acc:
+                # Very first 5-sec bar — start accumulating, nothing to emit yet
+                log.info(f"[bar] RealTimeBars stream active — first update minute_ts={minute_ts}")
+            elif acc['minute_ts'] != minute_ts:
+                # Minute rolled over — emit the completed bar
+                vol = acc['volume']
+                avg = acc['sum_wap_vol'] / vol if vol > 0 else acc['close']
+                bid = self._current_bid if self._current_bid else avg
+                ask = self._current_ask if self._current_ask else avg
                 vix = self._current_vix if self._current_vix else float('nan')
-                row = _assemble_bar(prev_bar, bid, ask, vix)
+                dt_str = datetime.fromtimestamp(acc['minute_ts']).strftime('%Y-%m-%d %H:%M:%S')
+                row = {
+                    'date':        dt_str,
+                    'vix':         round(float(vix), 4) if not math.isnan(vix) else None,
+                    'open':        acc['open'],
+                    'high':        acc['high'],
+                    'low':         acc['low'],
+                    'close':       acc['close'],
+                    'avg_bid':     round(float(bid), 4),
+                    'avg_ask':     round(float(ask), 4),
+                    'max_ask':     round(float(ask), 4),
+                    'min_bid':     round(float(bid), 4),
+                    'average':     round(float(avg), 4),
+                    'barCount':    acc['count'],
+                    'volume':      acc['volume'],
+                    'symbol':      SYMBOL,
+                    'localSymbol': SYMBOL,
+                    'conId':       '',
+                }
                 self.bar_queue.put(row)
-                log.debug(f"[bar] {prev_ts}  close={row['close']}  wap={row['average']}  "
-                          f"bid={row['avg_bid']}  ask={row['avg_ask']}  vix={row['vix']}")
-            self._live_trades_ts  = ts
-            self._live_trades_bar = bar
+                log.info(f"[bar] queued {dt_str}  close={row['close']}  wap={row['average']}  "
+                         f"bid={row['avg_bid']}  ask={row['avg_ask']}  vix={row['vix']}")
+                self._rtbar_acc = {}
+                acc = {}
+
+            if not acc:
+                self._rtbar_acc = {
+                    'minute_ts':   minute_ts,
+                    'open':        open_,
+                    'high':        high,
+                    'low':         low,
+                    'close':       close,
+                    'volume':      volume,
+                    'sum_wap_vol': wap * volume,
+                    'count':       count,
+                }
+            else:
+                self._rtbar_acc['high']        = max(acc['high'], high)
+                self._rtbar_acc['low']         = min(acc['low'],  low)
+                self._rtbar_acc['close']       = close
+                self._rtbar_acc['volume']      += volume
+                self._rtbar_acc['sum_wap_vol'] += wap * volume
+                self._rtbar_acc['count']       += count
 
     # ── positions ───────────────────────────────────────────────────────────────
 
@@ -616,74 +633,14 @@ def append_and_save(new_row: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def backfill_and_save(app: IBApp) -> pd.DataFrame:
     """
-    Wait for the three one-time historical requests (_HIST_* reqIds), merge by
-    minute timestamp, insert missing bars into aapl.csv, recompute indicators.
+    Load the existing extended CSV and return it.
 
-    BID_ASK historical bars use the same column mapping as the live projection:
-      avg_bid = bar.open, avg_ask = bar.close  (max_ask=high, min_bid=low)
-
-    If a historical stream fails (e.g. outside market hours), it is skipped
-    gracefully — existing CSV data is used as-is.
+    IB paper accounts do not provide HMDS (Historical Market Data Service),
+    so reqHistoricalData is unavailable.  Live bars come exclusively from
+    reqRealTimeBars (5-sec bars, accumulated to 1-min in realtimeBar).
+    The rolling CSV from previous sessions is used as-is for indicator context.
     """
-    log.info("[backfill] Waiting for historical data ...")
-    for rid, label in [(_HIST_TRADES_REQ, 'TRADES'),
-                       (_HIST_BIDASK_REQ, 'BID_ASK'),
-                       (_HIST_VIX_REQ,   'VIX')]:
-        if not app._hist_done[rid].wait(timeout=60):
-            log.warning(f"[backfill] {label} (reqId={rid}) timed out — skipping")
-
-    trades_map = {_bar_minute_key(b.date): b for b in app._hist_bars[_HIST_TRADES_REQ]}
-    bidask_map = {_bar_minute_key(b.date): b for b in app._hist_bars[_HIST_BIDASK_REQ]}
-    vix_map    = {_bar_minute_key(b.date): b for b in app._hist_bars[_HIST_VIX_REQ]}
-
-    # Require TRADES; BID_ASK is optional (fall back to WAP if empty)
-    all_ts = sorted(trades_map.keys())
-    log.info(f"[backfill] {len(all_ts)} TRADES bars  |  "
-             f"{len(bidask_map)} BID_ASK bars  |  {len(vix_map)} VIX bars")
-
-    df_raw = _load_raw()
-    existing_ts = set(df_raw['date'].dt.strftime('%Y%m%d %H:%M').tolist())
-
-    last_vix = None
-    new_rows = []
-    for ts in all_ts:
-        try:
-            dt = datetime.strptime(ts, '%Y%m%d %H:%M')
-        except ValueError:
-            continue
-        if dt.strftime('%Y%m%d %H:%M') in existing_ts:
-            continue
-
-        tb  = trades_map[ts]
-        bb  = bidask_map.get(ts)
-        vb  = vix_map.get(ts)
-
-        if vb:
-            last_vix = float(vb.high)
-        vix_val = last_vix if last_vix is not None else float('nan')
-
-        # BID_ASK mapping: open=avg_bid, close=avg_ask (matches 1_projection)
-        bid = float(bb.open)  if bb else float(tb.average)
-        ask = float(bb.close) if bb else float(tb.average)
-
-        new_rows.append(_assemble_bar(tb, bid, ask, vix_val))
-
-    if new_rows:
-        log.info(f"[backfill] Inserting {len(new_rows)} missing bars")
-        new_df = pd.DataFrame(new_rows)
-        new_df['date'] = pd.to_datetime(new_df['date'])
-        df_raw = (pd.concat([df_raw, new_df], ignore_index=True)
-                    .drop_duplicates(subset='date')
-                    .sort_values('date')
-                    .reset_index(drop=True)
-                    .tail(MAX_BARS)
-                    .reset_index(drop=True))
-        df_raw.to_csv(AAPL_CSV, index=False)
-    else:
-        log.info("[backfill] No missing bars — CSV is up to date")
-
-    df_ext = compute_indicators(df_raw.copy()).tail(MAX_BARS).reset_index(drop=True)
-    df_ext.to_csv(AAPL_EXT_CSV, index=False)
+    df_ext = pd.read_csv(AAPL_EXT_CSV, low_memory=False)
     log.info(f"[backfill] aapl_extended.csv ready ({len(df_ext)} rows)")
     return df_ext
 
@@ -701,6 +658,7 @@ _PS_COLS = [
     'high_water',             # WAP high-water mark — used to ratchet trailing stop
     'current_trailing_stop',  # updated every bar
     'pending_order_id',       # set when a market buy is waiting to fill
+    'pending_bars',           # incremented each bar while fill unconfirmed; cancel after 2
     # Covered call fields (populated when CC is opened)
     'cc_symbol', 'cc_local_symbol', 'cc_strike', 'cc_expiry',
     'cc_open_price', 'cc_open_time',
@@ -786,6 +744,8 @@ def _limit_order(action: str, qty: int, price: float) -> Order:
     o.totalQuantity = qty
     o.lmtPrice      = round(price, 2)
     o.tif           = 'DAY'
+    o.eTradeOnly    = False   # suppress TWS warning 10268
+    o.firmQuoteOnly = False
     return o
 
 
@@ -795,6 +755,8 @@ def _market_order(action: str, qty: int) -> Order:
     o.orderType     = 'MKT'
     o.totalQuantity = qty
     o.tif           = 'DAY'
+    o.eTradeOnly    = False   # suppress TWS warning 10268
+    o.firmQuoteOnly = False
     return o
 
 
@@ -1026,9 +988,24 @@ def cancel_stale_orders(app: IBApp, ps: pd.DataFrame) -> pd.DataFrame:
             ps.at[i, 'high_water']            = fill
             ps.at[i, 'current_trailing_stop'] = new_stop
             ps.at[i, 'pending_order_id']      = None
-        elif status in ('PreSubmitted', 'Submitted', ''):
-            # Market order still in flight — cancel and drop; signal can re-fire next bar
-            log.info(f"[orders] Cancelling unfilled buy order {oid} model={row['model_no']} — dropping row")
+            ps.at[i, 'pending_bars']          = 0
+        elif status == '':
+            # IB has not sent any orderStatus callback yet.
+            # Give it one more bar (2 total) before cancelling — handles delayed callbacks.
+            bars = int(float(row.get('pending_bars') or 0)) + 1
+            ps.at[i, 'pending_bars'] = bars
+            if bars < 2:
+                log.warning(f"[orders] order {oid} model={row['model_no']} — no status yet "
+                            f"(bar {bars}/2), waiting one more bar")
+            else:
+                log.warning(f"[orders] order {oid} model={row['model_no']} — no IB confirmation "
+                            f"after {bars} bars; cancelling and dropping row")
+                app.cancelOrder(oid)
+                rows_to_drop.append(i)
+        elif status in ('PreSubmitted', 'Submitted'):
+            # IB acknowledged but hasn't filled — market order should not sit here for 60s
+            log.info(f"[orders] Cancelling unfilled buy order {oid} model={row['model_no']} "
+                     f"status={status} — dropping row")
             app.cancelOrder(oid)
             rows_to_drop.append(i)
         else:
@@ -1117,6 +1094,7 @@ def check_buy_signals(
             'high_water':           bar_wap,
             'current_trailing_stop': stop,
             'pending_order_id':     oid,
+            'pending_bars':         0,
             'cc_symbol':            None, 'cc_local_symbol': None,
             'cc_strike':            None, 'cc_expiry':        None,
             'cc_open_price':        None, 'cc_open_time':     None,
@@ -1584,55 +1562,23 @@ def main():
     aapl = _stk_contract()
     vix  = _vix_contract()
 
-    # ── one-time historical backfill (keepUpToDate=False) ────────────────────
-    # IB does NOT support keepUpToDate=True for BID_ASK (error 321).
-    # Request all three as one-shot queries; live bid/ask comes from reqMktData.
-    for req_id, contract, what in [
-        (_HIST_TRADES_REQ, aapl, 'TRADES'),
-        (_HIST_BIDASK_REQ, aapl, 'BID_ASK'),
-        (_HIST_VIX_REQ,    vix,  'TRADES'),
-    ]:
-        app.reqHistoricalData(
-            reqId          = req_id,
-            contract       = contract,
-            endDateTime    = '',
-            durationStr    = HISTORY_DURATION,
-            barSizeSetting = '1 min',
-            whatToShow     = what,
-            useRTH         = 1,
-            formatDate     = 1,
-            keepUpToDate   = False,
-            chartOptions   = [],
-        )
-        log.info(f"[IB] Backfill request reqId={req_id}  {contract.symbol}  {what}")
-        time.sleep(0.5)   # IB pacing: avoid bursting multiple requests simultaneously
-
-    # ── live TRADES stream (bar driver, keepUpToDate=True) ────────────────────
-    app.reqHistoricalData(
-        reqId          = REQ_AAPL_TRADES,
-        contract       = aapl,
-        endDateTime    = '',
-        durationStr    = '1 D',           # minimal history; backfill already handled above
-        barSizeSetting = '1 min',
-        whatToShow     = 'TRADES',
-        useRTH         = 1,
-        formatDate     = 1,
-        keepUpToDate   = True,
-        chartOptions   = [],
-    )
-    log.info(f"[IB] Live TRADES stream reqId={REQ_AAPL_TRADES} keepUpToDate=True")
-
     # ── live bid/ask ticks via reqMktData ────────────────────────────────────
     # IB streams tickType 1 (Bid) and 2 (Ask) continuously for stock data.
     app.reqMktData(REQ_AAPL_MKTDATA, aapl, '', False, False, [])
     log.info(f"[IB] reqMktData AAPL bid/ask  reqId={REQ_AAPL_MKTDATA}")
 
     # ── live VIX via reqMktData ──────────────────────────────────────────────
-    # tickType 4 (Last) gives the current VIX index value.
     app.reqMktData(REQ_VIX_MKTDATA, vix, '', False, False, [])
     log.info(f"[IB] reqMktData VIX            reqId={REQ_VIX_MKTDATA}")
 
-    # ── backfill gap from historical data ─────────────────────────────────────
+    # ── 5-second real-time TRADES bars (bar driver) ───────────────────────────
+    # reqRealTimeBars uses a realtime quote line (same pool as reqMktData).
+    # IB delivers a 5-sec OHLCV+WAP bar every 5 seconds via realtimeBar().
+    # Our callback accumulates them into 1-minute bars on the bar_queue.
+    app.reqRealTimeBars(REQ_AAPL_RTBARS, aapl, 5, 'TRADES', True, [])
+    log.info(f"[IB] reqRealTimeBars AAPL TRADES  reqId={REQ_AAPL_RTBARS}")
+
+    # ── load indicator context from existing CSV ──────────────────────────────
     df_ext = backfill_and_save(app)
 
     # ── main bar loop ─────────────────────────────────────────────────────────
