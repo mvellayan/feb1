@@ -39,7 +39,9 @@ Files
   paper/data/buy_signals.csv          model combos (model_no, trend, momentum, volatility, volume)
   paper/data/position_support.csv     open position state — one row per active model
   paper/data/transaction.csv          append-only trade log — one row per leg
-  paper/logs/arbo701_YYYYMMDD.log     daily rotating log
+  paper/logs/arbo701_ops.log          hourly rotating operations log
+  paper/logs/arbo701_market.log       hourly rotating market/tick log
+  paper/logs/arbo701_trade.log        hourly rotating trade/execution log
 
 Restart idempotency
 ───────────────────
@@ -145,19 +147,60 @@ SRC_AAPL_EXT    = _BASE / 'data' / 'stock' / 'sq_AAPL_extended.csv'
 
 def _setup_logging() -> logging.Logger:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOGS_DIR / f"arbo701_{datetime.now().strftime('%Y%m%d')}.log"
     fmt = logging.Formatter(
         '%(asctime)s  %(levelname)-7s  %(message)s', datefmt='%H:%M:%S'
     )
-    fh = TimedRotatingFileHandler(log_file, when='midnight', backupCount=30,
-                                  encoding='utf-8')
-    fh.setFormatter(fmt)
+
+    trade_prefixes = (
+        '[BUY]', '[fill]', '[orders]', '[stop]', '[CC open]', '[stop exit]',
+        '[target]', '[CC buyback]', '[CC expiry]', '[EOD]', '[txn]',
+    )
+    market_prefixes = ('[tick]', '[bar]', '[trailing]', '[cc monitor]')
+
+    class _PrefixFilter(logging.Filter):
+        def __init__(self, prefixes: tuple[str, ...], include: bool):
+            super().__init__()
+            self.prefixes = prefixes
+            self.include = include
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            matched = any(msg.startswith(prefix) for prefix in self.prefixes)
+            return matched if self.include else not matched
+
+    def _hourly_handler(name: str, level: int) -> TimedRotatingFileHandler:
+        handler = TimedRotatingFileHandler(
+            LOGS_DIR / name,
+            when='H',
+            interval=1,
+            backupCount=24 * 14,
+            encoding='utf-8',
+        )
+        handler.suffix = '%Y%m%d_%H'
+        handler.setLevel(level)
+        handler.setFormatter(fmt)
+        return handler
+
+    ops = _hourly_handler('arbo701_ops.log', logging.INFO)
+    ops.addFilter(_PrefixFilter(trade_prefixes + market_prefixes, include=False))
+
+    market = _hourly_handler('arbo701_market.log', logging.DEBUG)
+    market.addFilter(_PrefixFilter(market_prefixes, include=True))
+
+    trade = _hourly_handler('arbo701_trade.log', logging.INFO)
+    trade.addFilter(_PrefixFilter(trade_prefixes, include=True))
+
     ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
+    ch.addFilter(_PrefixFilter(market_prefixes, include=False))
+
     lg = logging.getLogger('arbo701')
     lg.setLevel(logging.DEBUG)
     if not lg.handlers:
-        lg.addHandler(fh)
+        lg.addHandler(ops)
+        lg.addHandler(market)
+        lg.addHandler(trade)
         lg.addHandler(ch)
     return lg
 
@@ -874,7 +917,7 @@ def sync_on_startup(app: IBApp) -> pd.DataFrame:
                 try:
                     oid = int(float(oid_str))
                     log.info(f"[startup] Cancelling stale order {oid} (model {row['model_no']})")
-                    app.cancelOrder(oid, '')
+                    app.cancelOrder(oid)
                 except (ValueError, TypeError):
                     pass
         ps['pending_order_id'] = None
@@ -934,45 +977,53 @@ def _has_cc(row) -> bool:
 
 def cancel_stale_orders(app: IBApp, ps: pd.DataFrame) -> pd.DataFrame:
     """
-    Cancel any unfilled limit buy orders placed last bar.
-    Rows with a pending_order_id that is already Filled get their entry_price
-    updated from avg_fill and pending_order_id cleared.
+    Confirm fills and drop any unfilled buy orders from the prior bar.
+    Rows with a pending_order_id that is Filled get entry_price updated
+    from avg_fill and pending_order_id cleared.
+    Rows whose order did not fill (still pending or unexpected status) are
+    REMOVED from position_support — no ghost positions that could trigger
+    spurious sells.
     """
     ps = ps.copy()
+    rows_to_drop = []
+
     for i, row in ps.iterrows():
         if not _has_pending(row):
             continue
         try:
             oid = int(float(row['pending_order_id']))
         except (ValueError, TypeError):
-            ps.at[i, 'pending_order_id'] = None
+            rows_to_drop.append(i)
             continue
 
-        st = app.order_status.get(oid, {})
+        st     = app.order_status.get(oid, {})
         status = st.get('status', '')
 
         if status == 'Filled':
             fill = float(st.get('avg_fill', row['entry_price']))
             log.info(f"[fill] model={row['model_no']}  order {oid} filled @ {fill:.4f}")
             atr = float(row['atr_at_entry'])
-            # Recompute bracket using actual fill price (WAP approx = fill price here)
             new_stop   = round(fill - atr * ATR_STOP_MULT, 4)
             new_target = round(fill + atr * ATR_STOP_MULT * ATR_TARGET_RR, 4)
-            ps.at[i, 'entry_price']          = fill
-            ps.at[i, 'entry_wap']            = fill   # best approximation without live WAP
-            ps.at[i, 'stop_loss']            = new_stop
-            ps.at[i, 'profit_target']        = new_target
-            ps.at[i, 'high_water']           = fill
+            ps.at[i, 'entry_price']           = fill
+            ps.at[i, 'entry_wap']             = fill
+            ps.at[i, 'stop_loss']             = new_stop
+            ps.at[i, 'profit_target']         = new_target
+            ps.at[i, 'high_water']            = fill
             ps.at[i, 'current_trailing_stop'] = new_stop
-            ps.at[i, 'pending_order_id']     = None
-        elif status not in ('', 'PreSubmitted', 'Submitted'):
-            log.info(f"[orders] order {oid} status={status} — clearing")
-            ps.at[i, 'pending_order_id'] = None
+            ps.at[i, 'pending_order_id']      = None
+        elif status in ('PreSubmitted', 'Submitted', ''):
+            # Market order still in flight — cancel and drop; signal can re-fire next bar
+            log.info(f"[orders] Cancelling unfilled buy order {oid} model={row['model_no']} — dropping row")
+            app.cancelOrder(oid)
+            rows_to_drop.append(i)
         else:
-            # Still pending — cancel it; will retry on next bar if signal fires again
-            log.info(f"[orders] Cancelling unfilled buy order {oid} model={row['model_no']}")
-            app.cancelOrder(oid, '')
-            ps.at[i, 'pending_order_id'] = None
+            # Cancelled, Inactive, or other terminal non-fill status — drop
+            log.info(f"[orders] order {oid} status={status} model={row['model_no']} — dropping row")
+            rows_to_drop.append(i)
+
+    if rows_to_drop:
+        ps = ps.drop(index=rows_to_drop).reset_index(drop=True)
 
     return ps
 
@@ -1028,12 +1079,11 @@ def check_buy_signals(
         bar_wap = float(bar['average'])
         stop    = round(bar_wap - atr * ATR_STOP_MULT, 4)
         target  = round(bar_wap + atr * ATR_STOP_MULT * ATR_TARGET_RR, 4)
-        mid     = _mid(float(bar['avg_bid']), float(bar['avg_ask']))
         oid     = app.next_order_id()
 
-        app.placeOrder(oid, _stk_contract(), _limit_order('BUY', SHARES, mid))
+        app.placeOrder(oid, _stk_contract(), _market_order('BUY', SHARES))
         log.info(f"[BUY] model={mn} ({t}/{m}/{v}/{vol})  "
-                 f"limit={mid}  wap={bar_wap:.4f}  stop={stop}  target={target}  oid={oid}  "
+                 f"market  wap={bar_wap:.4f}  stop={stop}  target={target}  oid={oid}  "
                  f"atr={atr:.4f}  rsi={last_ext.get('rsi_14','?')}  "
                  f"adx={last_ext.get('adx_14','?')}  vwap={last_ext.get('vwp_vwap','?')}")
 
@@ -1042,7 +1092,7 @@ def check_buy_signals(
             'symbol':               SYMBOL,
             'local_symbol':         SYMBOL,
             'entry_time':           bar_dt.isoformat(),
-            'entry_price':          mid,
+            'entry_price':          bar_wap,   # estimated; updated to avg_fill on confirm
             'entry_wap':            bar_wap,
             'stop_loss':            stop,
             'profit_target':        target,
@@ -1061,7 +1111,7 @@ def check_buy_signals(
         _log_txn({
             'timestamp': bar_dt.isoformat(), 'model_no': mn,   'leg': 'stock',
             'action': 'BUY',                 'symbol': SYMBOL, 'local_symbol': SYMBOL,
-            'sec_type': 'STK',               'quantity': SHARES, 'price': mid,
+            'sec_type': 'STK',               'quantity': SHARES, 'price': bar_wap,
             'order_id': oid,                 'reason': f'signal_{t}_{m}_{v}_{vol}',
         })
         active_set.add(mn)
