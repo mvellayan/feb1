@@ -39,7 +39,7 @@ import pandas as pd
 
 # ── path setup ─────────────────────────────────────────────────────────────────
 _HERE   = Path(__file__).parent
-_MODEL1 = _HERE.parent / '1_tech_indicators_sock_trade'
+_MODEL1 = _HERE.parent / '1a_tech_indicators_sock_trade'
 _BASE   = _HERE.parent.parent          # /feb1/
 sys.path.insert(0, str(_MODEL1))  # signals/utils from model 1
 sys.path.insert(0, str(_HERE))    # local modules take precedence

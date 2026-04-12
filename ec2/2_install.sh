@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+
+# Bootstrap EC2 for headless IB Gateway via IBC (Interactive Brokers Controller).
+#
+# Usage:
+#   IB_USERNAME=myuser IB_PASSWORD=mypass bash ./2_install.sh
+#
+# Required env vars:
+#   IB_USERNAME   IB account username
+#   IB_PASSWORD   IB account password
+#
+# Optional env vars:
+#   TRADING_MODE  paper (default) | live
+#   IBC_VERSION   IBC release tag, default 3.19.0
+#   INSTANCE_INFO_FILE  default ec2_instance.txt
+
+set -euo pipefail
+
+INSTANCE_INFO_FILE="${INSTANCE_INFO_FILE:-ec2_instance.txt}"
+TRADING_MODE="${TRADING_MODE:-paper}"
+IBC_VERSION="${IBC_VERSION:-3.19.0}"
+
+# ── credentials ──────────────────────────────────────────────────────────────
+IB_USERNAME="${IB_USERNAME:-}"
+IB_PASSWORD="${IB_PASSWORD:-}"
+
+if [[ -z "$IB_USERNAME" || -z "$IB_PASSWORD" ]]; then
+  echo "ERROR: IB_USERNAME and IB_PASSWORD must be set."
+  echo "  IB_USERNAME=myuser IB_PASSWORD=mypass bash ./2_install.sh"
+  exit 1
+fi
+
+# ── read instance info ────────────────────────────────────────────────────────
+if [[ ! -f "$INSTANCE_INFO_FILE" ]]; then
+  echo "Missing $INSTANCE_INFO_FILE. Run ./1_create.sh first."
+  exit 1
+fi
+
+get_value() {
+  local key="$1"
+  awk -F= -v key="$key" '$1 == key { sub($1 FS, "", $0); print $0 }' "$INSTANCE_INFO_FILE"
+}
+
+HOST="${HOST:-$(get_value PUBLIC_DNS)}"
+SSH_USER="${SSH_USER:-$(get_value SSH_USER)}"
+KEY_PATH="${KEY_PATH:-$(get_value KEY_PATH)}"
+
+if [[ -z "$HOST" || -z "$SSH_USER" || -z "$KEY_PATH" ]]; then
+  echo "ec2_instance.txt is missing one of PUBLIC_DNS, SSH_USER, or KEY_PATH."
+  exit 1
+fi
+
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY_PATH")
+
+# ── build remote script ───────────────────────────────────────────────────────
+REMOTE_SCRIPT="$(mktemp)"
+trap 'rm -f "$REMOTE_SCRIPT"' EXIT
+
+# Credentials are interpolated here (on the local machine) before the script is
+# sent to the remote host.  The REMOTE_EOF delimiter is unquoted so that
+# $IB_USERNAME, $IB_PASSWORD, $TRADING_MODE, and $IBC_VERSION expand now.
+cat > "$REMOTE_SCRIPT" <<REMOTE_EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+IB_USERNAME='${IB_USERNAME}'
+IB_PASSWORD='${IB_PASSWORD}'
+TRADING_MODE='${TRADING_MODE}'
+IBC_VERSION='${IBC_VERSION}'
+
+IBC_DIR="\$HOME/ibc"
+IBG_DIR="\$HOME/Jts"
+LOG_DIR="\$HOME/logs"
+BIN_DIR="\$HOME/bin"
+DOWNLOAD_DIR="\$HOME/Downloads"
+
+mkdir -p "\$IBC_DIR" "\$IBG_DIR" "\$LOG_DIR" "\$BIN_DIR" "\$DOWNLOAD_DIR"
+
+fetch() {
+  local url="\$1" out="\$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL -o "\$out" "\$url"
+  else
+    wget -O "\$out" "\$url"
+  fi
+}
+
+# ── detect package manager ────────────────────────────────────────────────────
+if command -v dnf >/dev/null 2>&1; then PM=dnf; elif command -v yum >/dev/null 2>&1; then PM=yum; else
+  echo "No dnf or yum found"; exit 1
+fi
+
+# ── system packages ───────────────────────────────────────────────────────────
+sudo "\$PM" -y update
+
+PKGS=(
+  awscli wget tar gzip unzip python3 git
+  xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11
+  dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts
+  gtk3 libXtst libXrender libXi libXt alsa-lib procps-ng which
+)
+if [[ "\$PM" == "dnf" ]]; then
+  PKGS+=(java-17-amazon-corretto-headless)
+else
+  PKGS+=(java-17-amazon-corretto)
+fi
+sudo "\$PM" install -y "\${PKGS[@]}"
+
+# ── IB Gateway installer ──────────────────────────────────────────────────────
+ARCH="\$(uname -m)"
+case "\$ARCH" in
+  x86_64)   IBG_URL="https://download2.interactivebrokers.com/installers/ibgateway/latest-standalone/ibgateway-latest-standalone-linux-x64.sh" ;;
+  aarch64|arm64) IBG_URL="https://download2.interactivebrokers.com/installers/ibgateway/latest-standalone/ibgateway-latest-standalone-linux-arm64.sh" ;;
+  *) echo "Unsupported arch: \$ARCH"; exit 1 ;;
+esac
+
+IBG_INSTALLER="\$DOWNLOAD_DIR/ibgateway-installer.sh"
+fetch "\$IBG_URL" "\$IBG_INSTALLER"
+chmod +x "\$IBG_INSTALLER"
+
+# -q = unattended (install4j quiet mode); -dir = install root
+"\$IBG_INSTALLER" -q -dir "\$IBG_DIR"
+
+# Locate the binary (standalone install puts it directly in ibgateway/)
+IBG_BIN="\$(find "\$IBG_DIR" -maxdepth 4 -type f -name 'ibgateway' | head -n 1)"
+if [[ -z "\$IBG_BIN" ]]; then
+  echo "ERROR: ibgateway binary not found under \$IBG_DIR"
+  find "\$IBG_DIR" -maxdepth 4 -type f | head -30
+  exit 1
+fi
+IBG_BIN_DIR="\$(dirname "\$IBG_BIN")"
+echo "IB Gateway binary: \$IBG_BIN"
+
+# ── IBC (Interactive Brokers Controller) ──────────────────────────────────────
+# IBC automates the login dialog so ibgateway can run fully unattended.
+IBC_ZIP="\$DOWNLOAD_DIR/IBCLinux-\${IBC_VERSION}.zip"
+fetch "https://github.com/IbcAlpha/IBC/releases/download/\${IBC_VERSION}/IBCLinux-\${IBC_VERSION}.zip" "\$IBC_ZIP"
+unzip -o "\$IBC_ZIP" -d "\$IBC_DIR"
+chmod +x "\$IBC_DIR"/*.sh 2>/dev/null || true
+chmod +x "\$IBC_DIR"/scripts/*.sh 2>/dev/null || true
+
+# ── IBC config ────────────────────────────────────────────────────────────────
+cat > "\$IBC_DIR/config.ini" <<'CFGEOF'
+# IBC configuration — generated by 2_install.sh
+LogToConsole=yes
+FIX=no
+
+IbLoginId=IBLOGINID_PLACEHOLDER
+IbPassword=IBPASSWORD_PLACEHOLDER
+TradingMode=TRADINGMODE_PLACEHOLDER
+
+AcceptIncomingConnectionAction=accept
+ExistingSessionDetectedAction=primaryoverride
+ReadOnlyLogin=no
+AcceptNonBrokerageAccountWarning=yes
+CFGEOF
+
+# Substitute credentials (sed -i avoids issues with special chars in passwords)
+sed -i "s|IBLOGINID_PLACEHOLDER|\${IB_USERNAME}|g"    "\$IBC_DIR/config.ini"
+sed -i "s|IBPASSWORD_PLACEHOLDER|\${IB_PASSWORD}|g"   "\$IBC_DIR/config.ini"
+sed -i "s|TRADINGMODE_PLACEHOLDER|\${TRADING_MODE}|g" "\$IBC_DIR/config.ini"
+
+# ── headless launch script ────────────────────────────────────────────────────
+cat > "\$BIN_DIR/start-ibgateway.sh" <<LAUNCHEOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME=/home/ec2-user
+export DISPLAY=:1
+LOG_DIR="\$HOME/logs"
+mkdir -p "\$LOG_DIR"
+
+# Start Xvfb if not already running
+if ! pgrep -u ec2-user -f 'Xvfb :1' >/dev/null 2>&1; then
+  Xvfb :1 -screen 0 1280x800x24 -nolisten tcp >"\$LOG_DIR/xvfb.log" 2>&1 &
+  sleep 2
+fi
+
+IBC_DIR="\$HOME/ibc"
+IBG_BIN_DIR="\${IBG_BIN_DIR}"
+
+# IBCLinux.sh <TWS/IBG version or "latest"> <IBG path> <IBC config> GATEWAY
+exec "\$IBC_DIR/IBCLinux.sh" latest "\$IBG_BIN_DIR" "\$IBC_DIR/config.ini" GATEWAY \\
+  >>"\$LOG_DIR/ibgateway.log" 2>&1
+LAUNCHEOF
+chmod +x "\$BIN_DIR/start-ibgateway.sh"
+
+# ── systemd service ───────────────────────────────────────────────────────────
+sudo tee /etc/systemd/system/ibgateway.service >/dev/null <<'SVCEOF'
+[Unit]
+Description=IB Gateway (headless via IBC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user
+Environment=HOME=/home/ec2-user
+Environment=DISPLAY=:1
+ExecStart=/home/ec2-user/bin/start-ibgateway.sh
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable ibgateway.service
+
+# ── S3 sync + Python env ──────────────────────────────────────────────────────
+aws s3 sync s3://arbo1/feb1/ ~/feb1
+
+if command -v curl >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+else
+  wget -qO- https://astral.sh/uv/install.sh | sh
+fi
+
+if [[ -f ~/feb1/requirements.txt ]]; then
+  cd ~/feb1
+  [[ -d .venv ]] || ~/.local/bin/uv venv
+  ~/.local/bin/uv pip install -r requirements.txt
+fi
+
+echo ""
+echo "=== Install complete ==="
+echo "IB Gateway binary : \$IBG_BIN"
+echo "IBC config        : \$IBC_DIR/config.ini"
+echo "Launch script     : \$BIN_DIR/start-ibgateway.sh"
+echo "Service           : ibgateway.service (enabled, not yet started)"
+echo ""
+echo "Start gateway:"
+echo "  sudo systemctl start ibgateway"
+echo "  sudo systemctl status ibgateway --no-pager"
+echo "  tail -f ~/logs/ibgateway.log"
+REMOTE_EOF
+
+chmod +x "$REMOTE_SCRIPT"
+
+# ── ship and run ──────────────────────────────────────────────────────────────
+printf 'Uploading bootstrap script to %s...\n' "$HOST"
+scp "${SSH_OPTS[@]}" "$REMOTE_SCRIPT" "$SSH_USER@$HOST:/tmp/feb1-bootstrap.sh" >/dev/null
+
+printf 'Running bootstrap (this takes 5–10 min)...\n'
+ssh "${SSH_OPTS[@]}" "$SSH_USER@$HOST" 'bash /tmp/feb1-bootstrap.sh'
+
+printf '\n=== Remote install completed ===\n'
+printf 'SSH:    ssh -i "%s" %s@%s\n' "$KEY_PATH" "$SSH_USER" "$HOST"
+printf 'Start:  ssh -i "%s" %s@%s '\''sudo systemctl start ibgateway'\''\n' "$KEY_PATH" "$SSH_USER" "$HOST"
+printf 'Logs:   ssh -i "%s" %s@%s '\''tail -f ~/logs/ibgateway.log'\''\n' "$KEY_PATH" "$SSH_USER" "$HOST"

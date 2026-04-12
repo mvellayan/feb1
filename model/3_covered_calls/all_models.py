@@ -57,7 +57,7 @@ import numpy as np
 import pandas as pd
 
 _HERE   = Path(__file__).parent
-_MODEL1 = _HERE.parent / '1_tech_indicators_sock_trade'
+_MODEL1 = _HERE.parent / '1a_tech_indicators_sock_trade'
 sys.path.insert(0, str(_MODEL1))
 sys.path.insert(0, str(_HERE))
 
@@ -206,6 +206,8 @@ def run_all_models(
             for tr in model_trades:
                 tr.pop('_cc_evals', None)
                 tr.pop('_opt_pnl',  None)
+                tr.pop('_cc_candidates', None)
+                tr.pop('_cc_candidate_close', None)
             all_trades.extend(model_trades)
 
         if model_id % 100 == 0 or model_id == n_combos:

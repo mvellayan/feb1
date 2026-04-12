@@ -46,7 +46,7 @@ import numpy as np
 import pandas as pd
 
 _HERE   = Path(__file__).parent
-_MODEL1 = _HERE.parent / '1_tech_indicators_sock_trade'
+_MODEL1 = _HERE.parent / '1a_tech_indicators_sock_trade'
 sys.path.insert(0, str(_MODEL1))  # utils/signals from model 1
 sys.path.insert(0, str(_HERE))    # single_model from model 2 (takes precedence)
 

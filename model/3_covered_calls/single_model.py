@@ -44,7 +44,7 @@ import pandas as pd
 
 # ── path setup ─────────────────────────────────────────────────────────────────
 _HERE   = Path(__file__).parent
-_MODEL1 = _HERE.parent / '1_tech_indicators_sock_trade'
+_MODEL1 = _HERE.parent / '1a_tech_indicators_sock_trade'
 _BASE   = _HERE.parent.parent          # /feb1/
 sys.path.insert(0, str(_MODEL1))
 sys.path.insert(0, str(_HERE))
@@ -264,6 +264,40 @@ def find_cc_at_entry(
     return contract, option_df
 
 
+def find_cc_candidates_at_entry(
+    entry_date:    datetime.date,
+    entry_ts:      pd.Timestamp,
+    entry_price:   float,
+    strike_offsets: list[float] | None = None,
+) -> dict[float, dict]:
+    """Return all valid covered-call candidates for this entry."""
+    offsets = strike_offsets or STRIKE_OFFSETS
+    candidates: dict[float, dict] = {}
+
+    for offset in offsets:
+        contract, option_df = find_cc_at_entry(entry_date, entry_ts, entry_price, offset)
+        if contract is None or option_df is None:
+            continue
+
+        open_bid = get_option_price_at(
+            option_df, entry_ts, 'avg_bid', max_age_minutes=MAX_QUOTE_AGE_MINUTES
+        )
+        if open_bid is None:
+            continue
+
+        candidates[offset] = {
+            'offset': offset,
+            'contract': contract,
+            'option_df': option_df,
+            'symbol': contract.get('localSymbol', ''),
+            'strike': float(contract.get('strike_price', 0.0)),
+            'expiry': str(contract.get('expiration_date', '')),
+            'open_price': round(float(open_bid), 4),
+        }
+
+    return candidates
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SAMPLE DRAWING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -330,6 +364,7 @@ def simulate_cc_position(
     option_contract: dict,
     entry_price:     float,
     shares:          int,
+    cc_candidates:   dict[float, dict] | None = None,
     capture_evals:   bool = False,
 ) -> tuple[dict | None, dict | None]:
     """
@@ -358,8 +393,10 @@ def simulate_cc_position(
     stock_exit_price  = None
     stock_exit_reason = None
     stock_exit_time   = None
+    stock_close_bid   = None
     cc_bars = 0
     evals   = []
+    candidates = cc_candidates or {}
 
     for i in range(entry_iloc + 1, len(df_eow)):
         bar      = df_eow.iloc[i]
@@ -367,12 +404,18 @@ def simulate_cc_position(
         cc_bars += 1
 
         if capture_evals:
-            opt_ask_eval = (
-                get_option_price_at(option_df, bar_time, 'avg_ask',
-                                    max_age_minutes=MAX_QUOTE_AGE_MINUTES) or 0.0
-            )
-            evals.append((str(bar['date']), round(float(bar['average']), 4),
-                          round(opt_ask_eval, 4)))
+            eval_row = {
+                'eval_time': str(bar['date']),
+                'stock_avg': round(float(bar['average']), 4),
+                'asks': {},
+            }
+            for off, cand in candidates.items():
+                ask = get_option_price_at(
+                    cand['option_df'], bar_time, 'avg_ask',
+                    max_age_minutes=MAX_QUOTE_AGE_MINUTES,
+                )
+                eval_row['asks'][off] = round(float(ask), 4) if ask is not None else None
+            evals.append(eval_row)
 
         opt_ask = get_option_price_at(option_df, bar_time, 'avg_ask',
                                       max_age_minutes=MAX_QUOTE_AGE_MINUTES)
@@ -383,6 +426,7 @@ def simulate_cc_position(
             stock_exit_price  = float(bar['avg_bid'])
             stock_exit_reason = 'cc_buyback'
             stock_exit_time   = str(bar['date'])
+            stock_close_bid   = float(bar['avg_bid'])
             break
 
     if cc_close_price is None:
@@ -425,6 +469,17 @@ def simulate_cc_position(
         'cc_open_time':     str(entry_ts),
         'cc_open_price':    round(cc_open_price, 4),
         '_evals':           evals,
+        '_cc_candidates':   [
+            {
+                'offset': off,
+                'symbol': cand['symbol'],
+                'strike': cand['strike'],
+                'expiry': cand['expiry'],
+                'open_price': cand['open_price'],
+                'selected': cand['symbol'] == option_contract.get('localSymbol', ''),
+            }
+            for off, cand in sorted(candidates.items(), reverse=True)
+        ],
     }
 
     # ── Option leg ─────────────────────────────────────────────────────────────
@@ -448,6 +503,44 @@ def simulate_cc_position(
         'cc_strike':        strike,
         'cc_expiry':        str(option_contract.get('expiration_date', '')),
     }
+
+    candidate_close = []
+    close_ts = pd.Timestamp(cc_close_time)
+    for off, cand in sorted(candidates.items(), reverse=True):
+        close_ask = None
+        if cc_close_reason == 'buyback':
+            close_ask = get_option_price_at(
+                cand['option_df'], close_ts, 'avg_ask',
+                max_age_minutes=MAX_QUOTE_AGE_MINUTES,
+            )
+        else:
+            close_ask = 0.0
+
+        option_pnl = None
+        stock_exit = None
+        combined_pnl = None
+        if close_ask is not None:
+            option_pnl = (cand['open_price'] - float(close_ask)) * shares - COMMISSION
+            if cc_close_reason == 'buyback':
+                stock_exit = float(stock_close_bid)
+            else:
+                stock_exit = cand['strike'] if float(stock_close_bid) > cand['strike'] else float(stock_close_bid)
+
+            stock_pnl_candidate = shares * stock_exit - shares * entry_price - COMMISSION
+            combined_pnl = stock_pnl_candidate + option_pnl
+
+        candidate_close.append({
+            'offset': off,
+            'symbol': cand['symbol'],
+            'strike': cand['strike'],
+            'expiry': cand['expiry'],
+            'open_price': cand['open_price'],
+            'close_price': round(float(close_ask), 4) if close_ask is not None else None,
+            'option_pnl': round(float(option_pnl), 2) if option_pnl is not None else None,
+            'combined_pnl': round(float(combined_pnl), 2) if combined_pnl is not None else None,
+            'selected': cand['symbol'] == option_contract.get('localSymbol', ''),
+        })
+    stock_leg['_cc_candidate_close'] = candidate_close
 
     return stock_leg, option_leg
 
@@ -516,13 +609,40 @@ def _log_trade(fh, tr):
     )
     fh.write("\n")
 
+    cc_candidates = tr.get('_cc_candidates', [])
+    if cc_candidates:
+        fh.write("    options_considered\n")
+        for cand in cc_candidates:
+            sel = " selected" if cand.get('selected') else ""
+            fh.write(
+                f"    offset: [{cand['offset']:+.0f}]  strike: [{cand['strike']}]  "
+                f"ask_at_open: [{cand['open_price']}]  symbol: [{cand['symbol']}]  "
+                f"expiry: [{cand['expiry']}]{sel}\n"
+            )
+        fh.write("\n")
+
     cc_evals = tr.get('_cc_evals', [])
 
     def _fmt_cc(r):
-        t = str(r[0]).split(' ')[-1] if ' ' in str(r[0]) else str(r[0])
-        return f"    {t}    {r[1]}    {r[2]}\n"
+        t = str(r['eval_time']).split(' ')[-1] if ' ' in str(r['eval_time']) else str(r['eval_time'])
+        stock_avg = f"{r['stock_avg']:.2f}"
 
-    _write_evals(fh, "eval_time    stock_avg    option_ask", cc_evals, _fmt_cc)
+        def _fmt_ask(off: float) -> str:
+            ask = r.get('asks', {}).get(off)
+            return 'NA' if ask is None else f"{ask:.2f}"
+
+        return (
+            f"    {t}  {stock_avg:>6}  "
+            f"{_fmt_ask(3.0):>5}  {_fmt_ask(2.0):>5}  "
+            f"{_fmt_ask(-2.0):>5}  {_fmt_ask(-3.0):>5}\n"
+        )
+
+    _write_evals(
+        fh,
+        "time         stk      p3     p2     m2     m3",
+        cc_evals,
+        _fmt_cc,
+    )
 
     fh.write(
         f"exit_time: [{tr['exit_time']}]  "
@@ -555,6 +675,21 @@ def _log_trade(fh, tr):
             f"pnl_pct: [{tr['pnl_pct']}]  "
             f"is_winner: [{'TRUE' if tr['is_winner'] else 'FALSE'}]\n\n"
         )
+
+    candidate_close = tr.get('_cc_candidate_close', [])
+    if candidate_close:
+        fh.write("    possible_close_pnl_by_option\n")
+        for cand in candidate_close:
+            sel = " selected" if cand.get('selected') else ""
+            close_price = 'NA' if cand['close_price'] is None else cand['close_price']
+            option_pnl = 'NA' if cand['option_pnl'] is None else cand['option_pnl']
+            combined_pnl = 'NA' if cand['combined_pnl'] is None else cand['combined_pnl']
+            fh.write(
+                f"    offset: [{cand['offset']:+.0f}]  strike: [{cand['strike']}]  "
+                f"close_ask: [{close_price}]  option_pnl: [{option_pnl}]  "
+                f"combined_pnl: [{combined_pnl}]  symbol: [{cand['symbol']}]{sel}\n"
+            )
+        fh.write("\n")
 
 
 def _log_model_end(fh, seq_no, model_id, metrics):
@@ -712,10 +847,20 @@ def run_combo(
         entry_date = entry_ts.date()
         trade_date = row['fnd_trade_date']
 
-        # ── Find CC at fixed offset ────────────────────────────────────────────
-        contract, option_df = find_cc_at_entry(
-            entry_date, entry_ts, entry_price, strike_offset
+        cc_candidates = (
+            find_cc_candidates_at_entry(entry_date, entry_ts, entry_price)
+            if capture_evals else {}
         )
+
+        # ── Find CC at fixed offset ────────────────────────────────────────────
+        if capture_evals:
+            selected = cc_candidates.get(strike_offset)
+            contract = selected['contract'] if selected else None
+            option_df = selected['option_df'] if selected else None
+        else:
+            contract, option_df = find_cc_at_entry(
+                entry_date, entry_ts, entry_price, strike_offset
+            )
         if contract is None:
             continue   # no valid option at this offset → skip bar
 
@@ -729,7 +874,7 @@ def run_combo(
         # ── Simulate CC position ───────────────────────────────────────────────
         stock_leg, opt_leg = simulate_cc_position(
             df_eow, entry_iloc_eow, option_df, contract,
-            entry_price, shares, capture_evals,
+            entry_price, shares, cc_candidates, capture_evals,
         )
         if stock_leg is None:
             continue
@@ -754,6 +899,8 @@ def run_combo(
         }
 
         cc_evals = stock_leg.pop('_evals', [])
+        cc_candidates_log = stock_leg.pop('_cc_candidates', [])
+        cc_candidate_close = stock_leg.pop('_cc_candidate_close', [])
         stock_leg['_opt_pnl']  = opt_leg['pnl_dollar']
 
         positions.append({
@@ -772,7 +919,14 @@ def run_combo(
                for cat in ['trend', 'momentum', 'volatility', 'volume']},
             **entry_snapshot,
         }
-        trades.append({**base, 'leg': 'stock', **stock_leg, '_cc_evals': cc_evals})
+        trades.append({
+            **base,
+            'leg': 'stock',
+            **stock_leg,
+            '_cc_evals': cc_evals,
+            '_cc_candidates': cc_candidates_log,
+            '_cc_candidate_close': cc_candidate_close,
+        })
         trades.append({**base, 'leg': 'option', **opt_leg})
 
     if not positions:
@@ -1015,6 +1169,8 @@ def main():
             for tr in trades:
                 tr.pop('_cc_evals', None)
                 tr.pop('_opt_pnl',  None)
+                tr.pop('_cc_candidates', None)
+                tr.pop('_cc_candidate_close', None)
             all_trades.extend(trades)
 
     print(f"\n[output]  Log    -> {log_path}")
