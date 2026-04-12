@@ -2,7 +2,7 @@
 single_model.py
 
 Core trading simulation engine. Also runs as a standalone script to test a
-single indicator combination across 500 time windows.
+single indicator combination across 100 time windows.
 
 Engine functions (imported by batch_run_all_models.py)
 ───────────────────────────────────────────────────────
@@ -26,7 +26,7 @@ Standalone usage
 Output  (../reports/single_{combo}_{mmddhhmi}/)
 ──────
   single_{combo}_runs.csv    – one row per run (window + seed + metrics)
-  single_{combo}_trades.csv  – every trade across all 500 runs
+  single_{combo}_trades.csv  – every trade across all 100 runs
   run.log                    – structured trade-by-trade log
 """
 
@@ -65,7 +65,7 @@ EXIT_MINUTE      = 15 * 60 + 45   # 3:45 PM (kept for reference; exit is stop-lo
 END_OF_WEEK_EXIT = False           # when True: hold through Friday 4 PM instead of EOD
 
 # ── standalone run constants ───────────────────────────────────────────────────
-N_RUNS      = 500
+N_RUNS      = 100
 DATA_FIRST  = datetime.date(2023, 1, 1)   # overridable via --data-first
 DATA_LAST   = datetime.date(2026, 2, 28)  # overridable via --data-last
 WINDOW_DAYS = 14                           # overridable via --window-days
@@ -670,7 +670,7 @@ def _empty_summary(run_no, indicators, window_start, window_end, seed, status) -
 
 def parse_args() -> tuple[dict[str, str], bool, int, datetime.date, datetime.date, int]:
     parser = argparse.ArgumentParser(
-        description='Run a single indicator combination across 500 time windows.'
+        description='Run a single indicator combination across 100 time windows.'
     )
     parser.add_argument('--trend',      default='adx', help='Trend indicator      (blank = skip)')
     parser.add_argument('--momentum',   default='frc', help='Momentum indicator   (blank = skip)')
