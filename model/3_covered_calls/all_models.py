@@ -1,43 +1,40 @@
 """
 all_models.py — 3_covered_calls
 
-Orchestrates all 1,221 indicator combinations × 4 strike offsets = 4,884 scenarios
-across 100 time windows.
+Orchestrates all 1,221 indicator combinations across 100 time windows.
+Each combination fires 18 CC variants simultaneously (3 expiries × 6 strikes).
+Total scenario rows per window: 1,221 × 18 = 21,978.
 
-The strategy opens a covered call immediately at entry (not at stop trigger).
-Each combo is evaluated at four strike offsets:
-  +3  OTM call  (capped upside, lower premium)
-  +2  OTM call
-  -2  ITM call  (higher premium, stock upside capped below entry)
-  -3  ITM call
+The strategy opens all 12 covered call variants immediately at entry.
+Each variant is an independent simulation with its own exit logic.
 
-Purpose: determine which strike placement — ITM or OTM, and by how much — performs
-best across all indicator models.
+Purpose: determine which strike/expiry combination performs best across all
+indicator models.
 
 Simulation logic lives in single_model.py (this directory).
 This file handles:
-  - combination generation  (TREND × MOMENTUM × VOLATILITY × VOLUME × OFFSET)
+  - combination generation  (TREND × MOMENTUM × VOLATILITY × VOLUME)
   - window scheduling       (100 unique windows per execution)
   - CSV and log output
   - post-execution analysis and markdown report
 
 Pipeline per window
 ───────────────────
-1.  S.load_or_build_signals()       — load or build signals CSV (cached in memory)
-2.  S.prepare_window(...)           — filter window, draw sample, build day structures
-3.  run_all_models(...)             — loop 4,884 scenarios, call S.run_combo() for each
-4.  write_summary_csv / trades_csv  — persist results
-5.  summarize_run(run_dir)          — rank indicators and offsets after all 100 windows
+1.  S.load_or_build_signals()           — load or build signals CSV (cached in memory)
+2.  S.prepare_window(...)               — filter window, draw sample, build day structures
+3.  run_all_models(...)                 — loop 1,221 combos, call S.run_combo() for each
+4.  write_summary_csv / trades_csv      — persist results  (summary = 14,652 rows)
+5.  summarize_run(run_dir)              — rank combos and variants after all 100 windows
 
 Output  reports/{mmddhhmi}/
 ──────
-  {seq_no}_summary.csv
-  {seq_no}_trades.csv
-  {seq_no}_run.log
-  analysis_models.csv          — 1,221 combos ranked (across all offsets)
-  analysis_offset.csv          — 4 offsets ranked by aggregate performance
-  analysis_{cat}.csv           — per indicator category
-  analysis_pair_{a}_{b}.csv    — 6 indicator pair cross-tabs
+  {seq_no}_summary.csv      — 21,978 rows (1,221 combos × 18 variants)
+  {seq_no}_trades.csv       — all stock + option legs
+  {seq_no}_run.log          — trade-by-trade table log
+  analysis_combos.csv       — 1,221 combos ranked (across all variants)
+  analysis_option_variants.csv — 12 option variants ranked
+  analysis_{cat}.csv        — per indicator category
+  analysis_pair_{a}_{b}.csv — 6 indicator pair cross-tabs
   batch_run_analysis.md
 """
 
@@ -77,15 +74,15 @@ DATE_START  = '2023-01-01'
 DATE_END    = '2024-12-31'
 RANDOM_SEED = 313
 
-# ── strike offsets ─────────────────────────────────────────────────────────────
-STRIKE_OFFSETS = [3.0, 2.0, -2.0, -3.0]   # positive = OTM, negative = ITM
-OFFSET_LABELS  = {3.0: '+3 OTM', 2.0: '+2 OTM', -2.0: '-2 ITM', -3.0: '-3 ITM'}
-
 # ── indicator categories ────────────────────────────────────────────────────────
 TREND      = ['ema', 'macd', 'adx', 'sar', 'don', 'arn', 'vtx']
 MOMENTUM   = ['rsi', 'sto', 'cci', 'cmo', 'tsi', 'roc', 'frc', 'srsi', 'rmi', 'macd']
 VOLATILITY = ['atr', 'bbd', 'chp']
 VOLUME     = ['vwap', 'obv', 'mfi', 'klg', 'frc', 'vrc']
+
+# Variant definitions (mirror single_model.py)
+OPTION_VARIANTS = S.OPTION_VARIANTS   # [(expiry_label, strike_label), ...]
+STRIKE_LABELS   = S.STRIKE_LABELS     # ['s-2', 's-1', 's-0', 's+0', 's+1', 's+2']
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -98,6 +95,50 @@ def generate_combos() -> list:
         if len({t, m, v, vol}) == 4:
             combos.append((t, m, v, vol))
     return combos
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PER-VARIANT METRICS  (called by run_all_models to build summary rows)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _calc_variant_metrics_from_positions(
+    pos_list:     list[dict],
+    expiry_label: str,
+    strike_label: str,
+    variant_key:  str,
+    combo_info:   dict,
+    seq_no:       int,
+    model_id:     int,
+) -> dict:
+    """
+    Compute metrics for one (combo × variant) from positions list filtered
+    to that variant.
+    """
+    vp = [p for p in pos_list if p.get('expiry_label') == expiry_label
+                              and p.get('strike_label') == strike_label
+                              and p.get('combined_pnl') is not None
+                              and p.get('is_winner') is not None]
+
+    base = {
+        'batch_no':     seq_no,
+        'model_id':     model_id,
+        'trend':        combo_info['trend'],
+        'momentum':     combo_info['momentum'],
+        'volatility':   combo_info['volatility'],
+        'volume':       combo_info['volume'],
+        'expiry_label': expiry_label,
+        'strike_label': strike_label,
+        'variant_key':  variant_key,
+    }
+
+    if not vp:
+        return {**base, **S._empty_metrics('no_valid_positions')}
+
+    metrics = S._calc_metrics(vp)
+    n_vp = len(vp)
+    metrics['avg_stock_pnl']  = round(sum(p.get('stock_pnl', 0) or 0 for p in vp) / n_vp, 2)
+    metrics['avg_option_pnl'] = round(sum(p.get('option_pnl', 0) or 0 for p in vp) / n_vp, 2)
+    return {**base, **metrics}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -122,14 +163,14 @@ def write_trades_csv(trades_df: pd.DataFrame, seq_no: int, run_dir: Path) -> Pat
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / f'{seq_no}_trades.csv'
     col_order = [
-        'batch_no', 'model_id', 'strike_offset', 'trade_no', 'leg',
+        'batch_no', 'model_id', 'trade_no', 'leg',
         'trend', 'momentum', 'volatility', 'volume',
+        'variant_key', 'expiry_label', 'strike_label', 'strike', 'expiry_date',
         'trade_date', 'entry_time', 'exit_time', 'entry_price',
-        'strike',
         'atr_at_entry', 'rsi_at_entry', 'adx_at_entry', 'vwap_at_entry',
-        'exit_price', 'exit_reason', 'bars_held',
-        'shares', 'cost', 'proceeds', 'pnl_dollar', 'pnl_pct', 'is_winner',
-        'cc_option_symbol', 'cc_strike', 'cc_expiry', 'cc_open_time', 'cc_open_price',
+        'cc_open_price', 'exit_price', 'exit_reason', 'bars_held',
+        'shares', 'cost', 'proceeds', 'pnl_dollar', 'option_pnl',
+        'combined_pnl', 'is_winner', 'data_status',
     ]
     cols = [c for c in col_order if c in trades_df.columns]
     trades_df[cols].to_csv(path, index=False)
@@ -150,73 +191,110 @@ def run_all_models(
     log_fh=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Run all 1,221 combos × 4 offsets = 4,884 scenarios on one window.
-    Each (combo, offset) is independent.
+    Run all 1,221 combos on one window.
+    Each combo produces 12 variant summary rows = 14,652 total rows.
     """
     combos   = generate_combos()
     n_combos = len(combos)
-    n_total  = n_combos * len(STRIKE_OFFSETS)
+    n_total  = n_combos * len(OPTION_VARIANTS)
 
     summary_rows = []
     all_trades   = []
 
     print(f"\n[{seq_no}][backtest] Running {n_combos:,} combos × "
-          f"{len(STRIKE_OFFSETS)} offsets = {n_total:,} scenarios ...")
+          f"{len(OPTION_VARIANTS)} variants = {n_total:,} scenarios ...")
     print(f"[{seq_no}]           Sample size : {len(sample_idx):,} bars")
 
     for model_id, (t, m, v, vol) in enumerate(combos, 1):
         indicators = {'trend': t, 'momentum': m, 'volatility': v, 'volume': vol}
+        combo_info = {'trend': t, 'momentum': m, 'volatility': v, 'volume': vol}
 
-        for offset in STRIKE_OFFSETS:
-            try:
-                metrics, raw_trades = S.run_combo(
-                    df, sample_idx, day_dict, day_pos_map, indicators, offset,
-                    capture_evals=(log_fh is not None),
-                )
-            except Exception as exc:
-                err_msg = (f"[{seq_no}|M{model_id}|{offset:+.0f}] "
-                           f"ERROR in run_combo({t},{m},{v},{vol}): {exc}")
-                print(err_msg)
-                if log_fh is not None:
-                    log_fh.write(f"\n{err_msg}\n")
-                continue
+        try:
+            metrics, raw_trades, pos_list = S.run_combo(
+                df, sample_idx, day_dict, day_pos_map, indicators,
+                capture_evals=(log_fh is not None),
+            )
+        except Exception as exc:
+            err_msg = (f"[{seq_no}|M{model_id}] "
+                       f"ERROR in run_combo({t},{m},{v},{vol}): {exc}")
+            print(err_msg)
+            if log_fh is not None:
+                log_fh.write(f"\n{err_msg}\n")
+            continue
 
-            summary_rows.append({
-                'batch_no':     seq_no,
-                'model_id':     model_id,
-                'strike_offset': offset,
-                'trend': t, 'momentum': m, 'volatility': v, 'volume': vol,
-                **metrics,
-            })
+        # Build one summary row per variant
+        for expiry_label, strike_label in OPTION_VARIANTS:
+            variant_key = f"{expiry_label}/{strike_label}"
+            row = _calc_variant_metrics_from_positions(
+                pos_list, expiry_label, strike_label, variant_key,
+                combo_info, seq_no, model_id,
+            )
+            summary_rows.append(row)
 
-            model_trades = [
-                {'batch_no': seq_no, 'model_no': model_id, 'strike_offset': offset, **tr}
-                for tr in raw_trades
-            ]
+        model_trades = [
+            {'batch_no': seq_no, 'model_id': model_id, **tr}
+            for tr in raw_trades
+        ]
 
-            stock_trades = [tr for tr in model_trades if tr.get('leg') == 'stock']
-            if stock_trades and log_fh is not None:
-                S._log_model_start(log_fh, seq_no,
-                                   f"{model_id}|{offset:+.0f}", t, m, v, vol)
-                for tr in stock_trades:
-                    S._log_trade(log_fh, tr)
-                S._log_model_end(log_fh, seq_no,
-                                 f"{model_id}|{offset:+.0f}", metrics)
+        # Write log for this model (stock legs only, grouped by trade_no)
+        if log_fh is not None and raw_trades:
+            stock_trades = [tr for tr in raw_trades if tr.get('leg') == 'stock']
+            if stock_trades:
+                S._log_model_start(log_fh, seq_no, str(model_id), t, m, v, vol)
 
-            for tr in model_trades:
-                tr.pop('_cc_evals', None)
-                tr.pop('_opt_pnl',  None)
-                tr.pop('_cc_candidates', None)
-                tr.pop('_cc_candidate_close', None)
-            all_trades.extend(model_trades)
+                # Group by trade_no
+                trade_nos = sorted({tr['trade_no'] for tr in stock_trades})
+                for tno in trade_nos:
+                    vr = {}
+                    for tr in raw_trades:
+                        if tr.get('trade_no') == tno and tr.get('leg') == 'stock':
+                            ek  = tr.get('expiry_label', '')
+                            sl  = tr.get('strike_label', '')
+                            key = (ek, sl)
+                            vr[key] = {
+                                'variant_key':     tr.get('variant_key', ''),
+                                'expiry_label':    ek,
+                                'strike_label':    sl,
+                                'strike':          tr.get('strike'),
+                                'expiry_date':     (
+                                    datetime.date.fromisoformat(tr['expiry_date'])
+                                    if tr.get('expiry_date') else None
+                                ),
+                                'open_price':      tr.get('cc_open_price'),
+                                'cc_close_price':  tr.get('exit_price'),
+                                'cc_close_reason': tr.get('exit_reason', ''),
+                                'cc_close_time':   tr.get('exit_time'),
+                                'stock_exit_price': tr.get('exit_price'),
+                                'stock_exit_time': tr.get('exit_time'),
+                                'stock_pnl':       tr.get('pnl_dollar'),
+                                'option_pnl':      tr.get('option_pnl'),
+                                'combined_pnl':    tr.get('combined_pnl'),
+                                'is_winner':       tr.get('is_winner'),
+                                'data_status':     tr.get('data_status', ''),
+                            }
+                    first_tr = next(tr for tr in stock_trades if tr['trade_no'] == tno)
+                    entry_snap = {
+                        'entry_time':    first_tr.get('entry_time', ''),
+                        'entry_price':   first_tr.get('entry_price', 0.0),
+                        'shares':        first_tr.get('shares', S.SHARES),
+                        'atr_at_entry':  first_tr.get('atr_at_entry'),
+                        'rsi_at_entry':  first_tr.get('rsi_at_entry'),
+                        'adx_at_entry':  first_tr.get('adx_at_entry'),
+                        'vwap_at_entry': first_tr.get('vwap_at_entry'),
+                    }
+                    S._log_trade_table(log_fh, tno, indicators, entry_snap, vr, [])
+
+                S._log_model_end(log_fh, seq_no, str(model_id), metrics)
+
+        all_trades.extend(model_trades)
 
         if model_id % 100 == 0 or model_id == n_combos:
-            scenarios_done = model_id * len(STRIKE_OFFSETS)
             print(f"  [{seq_no}|M{model_id:>5}/{n_combos}]  "
-                  f"scenarios: {scenarios_done:,}/{n_total:,}  "
-                  f"trades so far: {len(all_trades):,}")
+                  f"trades so far: {len(all_trades):,}  "
+                  f"summary rows: {len(summary_rows):,}")
 
-    print(f"\n[{seq_no}][backtest] Complete.  Total trades: {len(all_trades):,}")
+    print(f"\n[{seq_no}][backtest] Complete.  Total trades: {len(all_trades):,}  "
+          f"Summary rows: {len(summary_rows):,}")
 
     trades_df = pd.DataFrame(all_trades) if all_trades else pd.DataFrame()
     return pd.DataFrame(summary_rows), trades_df
@@ -235,7 +313,7 @@ def run_model_set(
 ):
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"\n{'='*60}")
-    print(f"[{seq_no}]  AAPL Intraday Backtest (CC Entry)  |  start at {ts}")
+    print(f"[{seq_no}]  AAPL Intraday Backtest (CC Variants)  |  start at {ts}")
     print(f"[{seq_no}]  Window: {date_start} -> {date_end}  seed: {seed}")
     print(f"{'='*60}\n")
 
@@ -254,7 +332,7 @@ def run_model_set(
     with open(log_path, 'w', encoding='utf-8') as log_fh:
         log_fh.write(
             f"seq_no: [{seq_no}]  window: {date_start} -> {date_end}"
-            f"  seed: {seed}  model: [cc_entry]  generated: {ts}\n"
+            f"  seed: {seed}  model: [cc_variants]  generated: {ts}\n"
         )
         summary_df, trades_df = run_all_models(
             df, sample_idx, day_dict, day_pos_map, seq_no, log_fh=log_fh,
@@ -269,37 +347,38 @@ def run_model_set(
     print(f"\n{'='*60}")
     print(f"[{seq_no}]  RUN COMPLETE")
     print(f"{'='*60}")
-    print(f"[{seq_no}]  Scenarios run    : {len(summary_df):,}")
+    print(f"[{seq_no}]  Summary rows     : {len(summary_df):,}")
     print(f"[{seq_no}]  With trades      : {len(sdf_active):,}")
-    print(f"[{seq_no}]  Total trades     : {len(trades_df):,}")
+    print(f"[{seq_no}]  Total trade rows : {len(trades_df):,}")
 
     if not sdf_active.empty:
         best  = sdf_active.loc[sdf_active['total_pnl'].idxmax()]
         worst = sdf_active.loc[sdf_active['total_pnl'].idxmin()]
         print(
-            f"[{seq_no}]  Best  : [M{int(best['model_id'])}|{best['strike_offset']:+.0f}] "
+            f"[{seq_no}]  Best  : [M{int(best['model_id'])}|{best['variant_key']}] "
             f"{best['trend'].upper()}+{best['momentum'].upper()}+"
             f"{best['volatility'].upper()}+{best['volume'].upper()} "
             f"  P&L=${best['total_pnl']:,.2f}  Sharpe={best['sharpe']:.2f}"
         )
         print(
-            f"[{seq_no}]  Worst : [M{int(worst['model_id'])}|{worst['strike_offset']:+.0f}] "
+            f"[{seq_no}]  Worst : [M{int(worst['model_id'])}|{worst['variant_key']}] "
             f"{worst['trend'].upper()}+{worst['momentum'].upper()}+"
             f"{worst['volatility'].upper()}+{worst['volume'].upper()} "
             f"  P&L=${worst['total_pnl']:,.2f}  Sharpe={worst['sharpe']:.2f}"
         )
 
-    # ── Per-offset quick summary ──────────────────────────────────────────────
-    print(f"\n[{seq_no}]  Per-offset breakdown (active scenarios only):")
-    print(f"[{seq_no}]  {'Offset':<12} {'Scenarios':>9} {'Avg PnL':>10} "
+    # ── Per-variant quick summary ─────────────────────────────────────────────
+    print(f"\n[{seq_no}]  Per-variant breakdown (active scenarios only):")
+    print(f"[{seq_no}]  {'Variant':<12} {'Scenarios':>9} {'Avg PnL':>10} "
           f"{'Win%':>7} {'Avg Sharpe':>11}")
-    for offset in STRIKE_OFFSETS:
-        sub = sdf_active[sdf_active['strike_offset'] == offset]
+    for expiry_label, strike_label in OPTION_VARIANTS:
+        vkey = f"{expiry_label}/{strike_label}"
+        sub  = sdf_active[sdf_active['variant_key'] == vkey]
         if sub.empty:
             continue
         print(
             f"[{seq_no}]  "
-            f"{OFFSET_LABELS[offset]:<12} "
+            f"{vkey:<12} "
             f"{len(sub):>9,} "
             f"${sub['total_pnl'].mean():>9,.2f} "
             f"{sub['win_rate'].mean():>6.1f}% "
@@ -318,39 +397,53 @@ def _run_window(args: tuple) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OFFSET ANALYSIS
+# OPTION VARIANT ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def analyse_offsets(df: pd.DataFrame, n_batches: int) -> pd.DataFrame:
+def analyse_option_variants(df: pd.DataFrame, n_batches: int) -> pd.DataFrame:
     """
-    Aggregate performance by strike_offset across all models and all batches.
-    Returns one row per offset, ranked by consistency_score.
+    Aggregate performance by option variant (expiry_label + strike_label)
+    across all 1,221 combos and all batches.
+    Returns one row per variant (18 rows), ranked by consistency_score.
     """
     active = df[df['n_trades'] > 0]
     rows   = []
-    for offset, grp in active.groupby('strike_offset'):
-        pf_capped = grp['profit_factor'].clip(upper=PF_CAP)
-        pnl_hit   = (grp['total_pnl'] > 0).mean()
-        sharpe_hit = (grp['sharpe'] > 0).mean()
+    for (expiry_label, strike_label), grp in active.groupby(['expiry_label', 'strike_label']):
+        variant_key  = f"{expiry_label}/{strike_label}"
+        pf_capped    = grp['profit_factor'].clip(upper=PF_CAP)
+        pnl_hit      = (grp['total_pnl'] > 0).mean()
+        sharpe_hit   = (grp['sharpe'] > 0).mean()
         score = min(100.0, (
             0.40 * pnl_hit
             + 0.25 * sharpe_hit
             + 0.20 * grp['win_rate'].mean() / 100
             + 0.15 * pf_capped.mean() / 10
         ) * 100)
+
+        # Best combo for this variant by total_pnl
+        best_grp = grp.loc[grp['total_pnl'].idxmax()]
+        best_combo = (
+            f"{best_grp['trend'].upper()}+"
+            f"{best_grp['momentum'].upper()}+"
+            f"{best_grp['volatility'].upper()}+"
+            f"{best_grp['volume'].upper()}"
+            if all(c in best_grp.index for c in ['trend', 'momentum', 'volatility', 'volume'])
+            else ''
+        )
+
         rows.append({
-            'strike_offset':     offset,
-            'label':             OFFSET_LABELS.get(offset, str(offset)),
-            'batch_count':       int(grp['batch_no'].nunique()),
-            'scenario_count':    len(grp),
+            'variant_key':       variant_key,
+            'expiry_label':      expiry_label,
+            'strike_label':      strike_label,
+            'batch_count':       int(grp['batch_no'].nunique()) if 'batch_no' in grp.columns else n_batches,
             'avg_trades':        round(grp['n_trades'].mean(), 1),
             'avg_win_rate':      round(grp['win_rate'].mean(), 1),
             'avg_total_pnl':     round(grp['total_pnl'].mean(), 2),
             'pnl_hit_rate':      round(pnl_hit, 3),
             'avg_sharpe':        round(grp['sharpe'].mean(), 3),
             'avg_pf':            round(pf_capped.mean(), 3),
-            'avg_drawdown':      round(grp['max_drawdown'].mean(), 2),
             'consistency_score': round(score, 1),
+            'best_combo':        best_combo,
         })
     result = pd.DataFrame(rows).sort_values('consistency_score', ascending=False)
     result.insert(0, 'rank', range(1, len(result) + 1))
@@ -363,7 +456,7 @@ def analyse_offsets(df: pd.DataFrame, n_batches: int) -> pd.DataFrame:
 
 def write_markdown_report(
     models_df:    pd.DataFrame,
-    offset_df:    pd.DataFrame,
+    variants_df:  pd.DataFrame,
     category_dfs: dict,
     pair_dfs:     dict,
     n_batches:    int,
@@ -373,7 +466,7 @@ def write_markdown_report(
     now  = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     path = run_dir / 'batch_run_analysis.md'
 
-    lines = ['# Batch Run Analysis — Covered Call Entry — Strike Offset Study']
+    lines = ['# Batch Run Analysis — Covered Call Variants (3 expiries × 4 strikes)']
     lines.append(f'\n_Generated: {now}_\n')
     lines.append('## Overview\n')
     lines.append('| Metric | Value |')
@@ -382,7 +475,8 @@ def write_markdown_report(
     lines.append(f'| Runs analysed             | {n_batches} |')
     lines.append(f'| Total scenario-runs       | {total_rows:,} |')
     lines.append(f'| Unique combos (4-tuple)   | {len(models_df):,} |')
-    lines.append(f'| Strike offsets tested     | {", ".join(OFFSET_LABELS.values())} |')
+    lines.append(f'| Option variants tested    | 18 (w0/w1/w2 × s-2/s-1/s-0/s+0/s+1/s+2) |')
+    lines.append(f'| Summary rows per window   | 21,978 (1,221 × 18) |')
     lines.append(f'| Min runs threshold        | {MIN_BATCHES} |')
     lines.append(f'| Profit factor cap         | {PF_CAP} |')
     lines.append('')
@@ -395,50 +489,51 @@ def write_markdown_report(
     lines.append('(all terms normalised to 0–1, score reported 0–100)')
     lines.append('```\n')
 
-    # ── Strike offset rankings ───────────────────────────────────────────────
-    lines.append('## Strike Offset Rankings\n')
-    lines.append('_Compares ITM vs OTM calls across all models and all windows._\n')
-    offset_display_cols = [
-        'rank', 'label', 'scenario_count', 'avg_trades', 'avg_win_rate',
+    # ── Option variant rankings ────────────────────────────────────────────────
+    lines.append('## Option Variant Rankings (Table 2)\n')
+    lines.append('_Compares all 12 option variants across all 1,221 combos and all windows._\n')
+    variant_display_cols = [
+        'rank', 'variant_key', 'expiry_label', 'strike_label',
+        'batch_count', 'avg_trades', 'avg_win_rate',
         'avg_total_pnl', 'pnl_hit_rate', 'avg_sharpe', 'avg_pf',
-        'avg_drawdown', 'consistency_score',
+        'consistency_score', 'best_combo',
     ]
-    lines.append(md_table(offset_df[[c for c in offset_display_cols
-                                     if c in offset_df.columns]], n=len(offset_df)))
+    lines.append(md_table(
+        variants_df[[c for c in variant_display_cols if c in variants_df.columns]],
+        n=len(variants_df)
+    ))
     lines.append('')
 
-    # ── Top models (all offsets combined) ────────────────────────────────────
+    # ── Top combos ────────────────────────────────────────────────────────────
     display_model_cols = [
         'rank', 'trend', 'momentum', 'volatility', 'volume',
         'batch_count', 'avg_trades', 'avg_win_rate', 'avg_total_pnl',
         'pnl_hit_rate', 'avg_sharpe', 'avg_pf', 'consistency_score',
     ]
-    lines.append(f'## Top {TOP_N} Indicator Combos (all offsets combined)\n')
-    lines.append(md_table(models_df[display_model_cols]))
+    lines.append(f'## Top {TOP_N} Indicator Combos — Table 1 (all variants combined)\n')
+    lines.append(md_table(models_df[[c for c in display_model_cols if c in models_df.columns]]))
     lines.append('')
 
-    bottom = models_df[display_model_cols].tail(TOP_N).iloc[::-1].copy()
+    bottom = models_df[[c for c in display_model_cols if c in models_df.columns]].tail(TOP_N).iloc[::-1].copy()
     bottom['rank'] = range(1, len(bottom) + 1)
     lines.append(f'## Bottom {TOP_N} Indicator Combos\n')
     lines.append(md_table(bottom))
     lines.append('')
 
-    # ── Per-offset top combos ─────────────────────────────────────────────────
-    # Load combined summary for per-offset subsetting
-    # (models_df is aggregated across offsets; we need per-offset breakdown)
-
-    # ── Category rankings ─────────────────────────────────────────────────────
+    # ── Category rankings ──────────────────────────────────────────────────────
     for cat, cdf in category_dfs.items():
         display_cols = [
             'rank', cat, 'batch_count', 'avg_trades', 'avg_win_rate',
             'avg_total_pnl', 'pnl_hit_rate', 'avg_sharpe', 'consistency_score',
         ]
         lines.append(f'## {cat.capitalize()} Indicator Rankings\n')
-        lines.append(md_table(cdf[[c for c in display_cols if c in cdf.columns]],
-                               n=len(cdf)))
+        lines.append(md_table(
+            cdf[[c for c in display_cols if c in cdf.columns]],
+            n=len(cdf)
+        ))
         lines.append('')
 
-    # ── Pair rankings ─────────────────────────────────────────────────────────
+    # ── Pair rankings ──────────────────────────────────────────────────────────
     for (cat_a, cat_b), pdf in pair_dfs.items():
         display_cols = [
             'rank', cat_a, cat_b, 'batch_count', 'avg_trades',
@@ -446,11 +541,128 @@ def write_markdown_report(
             'avg_sharpe', 'consistency_score',
         ]
         lines.append(f'## Pair Rankings: {cat_a.capitalize()} × {cat_b.capitalize()}\n')
-        lines.append(md_table(pdf[[c for c in display_cols if c in pdf.columns]]))
+        lines.append(md_table(
+            pdf[[c for c in display_cols if c in pdf.columns]]
+        ))
         lines.append('')
 
     path.write_text('\n'.join(lines), encoding='utf-8')
     print(f"[report]  Markdown  -> {path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALL-RUNS ACCUMULATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def append_to_all_runs(df: pd.DataFrame, run_dir: Path) -> None:
+    """
+    Aggregate the full-run summary df by (combo × variant) and append one row
+    per combination to REPORTS_DIR/all_runs.csv.
+
+    Columns written
+    ───────────────
+    run_ts          — folder name of this batch run (mmddhhmi)
+    model_id        — sequential model index 1-1221 (deterministic across runs)
+    model_detail    — trend_momentum_volatility_volume (e.g. ema_rsi_atr_vwap)
+    variant         — w0/s+1 … w2/s-2
+    avg_stock_pnl   — weighted-avg per-trade stock P&L across all windows
+    avg_option_pnl  — weighted-avg per-trade option P&L across all windows
+    avg_total_pnl   — weighted-avg per-trade combined P&L across all windows
+    trade_count     — total trades across all windows for this combo+variant
+    win_pct         — weighted-avg win rate across all windows
+    total_pnl       — sum of total_pnl across all windows
+    sharpe          — mean Sharpe ratio across windows
+    profit_factor   — mean profit factor across windows (capped at PF_CAP)
+    max_drawdown    — worst (min) max_drawdown across windows
+    avg_bars_held   — weighted-avg bars held per trade
+    consistency_score — composite score: 0.40*pnl_hit + 0.25*sharpe_hit
+                        + 0.20*win_rate/100 + 0.15*pf/10  (0-100 scale)
+    """
+    all_runs_path = REPORTS_DIR / 'all_runs.csv'
+    run_ts = run_dir.name
+
+    active = df[df['n_trades'] > 0].copy()
+    if active.empty:
+        print("[all_runs]  No active rows — skipping.")
+        return
+
+    group_cols = ['model_id', 'trend', 'momentum', 'volatility', 'volume', 'variant_key']
+    # model_id may not be present if summary was built without it; fall back gracefully
+    group_cols = [c for c in group_cols if c in active.columns]
+    min_group  = ['trend', 'momentum', 'volatility', 'volume', 'variant_key']
+    if not all(c in active.columns for c in min_group):
+        print("[all_runs]  Required group columns missing — skipping.")
+        return
+
+    rows = []
+    for keys, grp in active.groupby(group_cols, sort=False):
+        key_dict = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
+        t   = key_dict['trend']
+        m   = key_dict['momentum']
+        v   = key_dict['volatility']
+        vol = key_dict['volume']
+        vkey = key_dict['variant_key']
+
+        n_total = int(grp['n_trades'].sum())
+        if n_total == 0:
+            continue
+
+        def _wavg(col: str, fallback: float = 0.0) -> float:
+            """Weighted average of col by n_trades; falls back to unweighted mean if col missing."""
+            if col not in grp.columns:
+                return fallback
+            return round(float((grp[col] * grp['n_trades']).sum() / n_total), 2)
+
+        pf_capped  = grp['profit_factor'].clip(upper=PF_CAP) if 'profit_factor' in grp.columns else pd.Series([0.0])
+        pnl_hit    = float((grp['total_pnl'] > 0).mean()) if 'total_pnl' in grp.columns else 0.0
+        sharpe_col = grp['sharpe'] if 'sharpe' in grp.columns else pd.Series([0.0])
+        sharpe_hit = float((sharpe_col > 0).mean())
+        wr_mean    = float(grp['win_rate'].mean()) / 100 if 'win_rate' in grp.columns else 0.0
+        score      = min(100.0, (
+            0.40 * pnl_hit
+            + 0.25 * sharpe_hit
+            + 0.20 * wr_mean
+            + 0.15 * float(pf_capped.mean()) / 10
+        ) * 100)
+
+        rows.append({
+            'run_ts':             run_ts,
+            'model_id':           int(key_dict.get('model_id', 0)) if 'model_id' in key_dict else '',
+            'model_detail':       f"{t}_{m}_{v}_{vol}",
+            'variant':            vkey,
+            'avg_stock_pnl':      _wavg('avg_stock_pnl'),
+            'avg_option_pnl':     _wavg('avg_option_pnl'),
+            'avg_total_pnl':      _wavg('avg_pnl'),
+            'trade_count':        n_total,
+            'win_pct':            _wavg('win_rate'),
+            'total_pnl':          round(float(grp['total_pnl'].sum()), 2) if 'total_pnl' in grp.columns else 0.0,
+            'sharpe':             round(float(sharpe_col.mean()), 3),
+            'profit_factor':      round(float(pf_capped.mean()), 3),
+            'max_drawdown':       round(float(grp['max_drawdown'].min()), 2) if 'max_drawdown' in grp.columns else 0.0,
+            'avg_bars_held':      _wavg('avg_duration_bars'),
+            'consistency_score':  round(score, 1),
+        })
+
+    if not rows:
+        print("[all_runs]  No rows to append.")
+        return
+
+    col_order = [
+        'run_ts', 'model_id', 'model_detail', 'variant',
+        'avg_stock_pnl', 'avg_option_pnl', 'avg_total_pnl',
+        'trade_count', 'win_pct', 'total_pnl',
+        'sharpe', 'profit_factor', 'max_drawdown', 'avg_bars_held',
+        'consistency_score',
+    ]
+    new_df = pd.DataFrame(rows)
+    new_df = new_df[[c for c in col_order if c in new_df.columns]]
+
+    write_header = not all_runs_path.exists()
+    new_df.to_csv(all_runs_path, mode='a', header=write_header, index=False)
+    print(f"[all_runs]  Appended {len(new_df):,} rows  ->  {all_runs_path}")
+    print(f"[all_runs]  run_ts={run_ts}  "
+          f"combos={len(new_df) // len(S.OPTION_VARIANTS)}  "
+          f"variants={len(S.OPTION_VARIANTS)}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -464,17 +676,26 @@ def summarize_run(run_dir: Path):
 
     df, n_batches = load_all_summaries(run_dir=run_dir)
 
-    # ── Offset rankings ───────────────────────────────────────────────────────
-    print("[analyse] Strike offset rankings ...")
-    offset_df = analyse_offsets(df, n_batches)
-    offset_df.to_csv(run_dir / 'analysis_offset.csv', index=False)
-    print(f"          {len(offset_df)} offsets ranked  ->  analysis_offset.csv")
+    # Rename columns if needed (summary CSV uses 'number_of_trades' etc.)
+    rename_map = {
+        'number_of_trades': 'n_trades',
+        'avg_entry_price':  'avg_entry',
+        'avg_exit_price':   'avg_exit',
+        'avg_bars_held':    'avg_duration_bars',
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    # ── Full model combinations (collapse across offsets) ─────────────────────
+    # ── Option variant rankings (Table 2) ────────────────────────────────────
+    print("[analyse] Option variant rankings ...")
+    variants_df = analyse_option_variants(df, n_batches)
+    variants_df.to_csv(run_dir / 'analysis_option_variants.csv', index=False)
+    print(f"          {len(variants_df)} variants ranked  ->  analysis_option_variants.csv")
+
+    # ── Full model combinations (Table 1 — collapse across variants) ──────────
     print("[analyse] Full model combinations ...")
     models_df = analyse_full_models(df, n_batches)
-    models_df.to_csv(run_dir / 'analysis_models.csv', index=False)
-    print(f"          {len(models_df):,} models ranked  ->  analysis_models.csv")
+    models_df.to_csv(run_dir / 'analysis_combos.csv', index=False)
+    print(f"          {len(models_df):,} models ranked  ->  analysis_combos.csv")
 
     # ── Category rankings ─────────────────────────────────────────────────────
     category_dfs = {}
@@ -500,19 +721,23 @@ def summarize_run(run_dir: Path):
         pair_dfs[(cat_a, cat_b)] = pdf
 
     print("\n[report]  Writing markdown ...")
-    write_markdown_report(models_df, offset_df, category_dfs, pair_dfs,
+    write_markdown_report(models_df, variants_df, category_dfs, pair_dfs,
                           n_batches, len(df), run_dir)
+
+    # ── Append to persistent all_runs.csv ────────────────────────────────────
+    print("\n[all_runs] Appending to all_runs.csv ...")
+    append_to_all_runs(df, run_dir)
 
     # ── Console summary ───────────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print("  STRIKE OFFSET RANKINGS")
+    print("  OPTION VARIANT RANKINGS")
     print(f"{'='*60}")
-    print(f"  {'Rank':<5} {'Label':<12} {'Avg PnL':>10} {'Win%':>7} "
+    print(f"  {'Rank':<5} {'Variant':<12} {'Avg PnL':>10} {'Win%':>7} "
           f"{'Sharpe':>8} {'Score':>7}")
-    for _, r in offset_df.iterrows():
+    for _, r in variants_df.iterrows():
         print(
             f"  #{int(r['rank']):<4} "
-            f"{r['label']:<12} "
+            f"{r['variant_key']:<12} "
             f"${r['avg_total_pnl']:>9,.2f} "
             f"{r['avg_win_rate']:>6.1f}% "
             f"{r['avg_sharpe']:>8.3f} "
@@ -520,7 +745,7 @@ def summarize_run(run_dir: Path):
         )
 
     print(f"\n{'='*60}")
-    print("  TOP 5 CONSISTENT MODELS (all offsets combined)")
+    print("  TOP 5 CONSISTENT MODELS (all variants combined)")
     print(f"{'='*60}")
     for _, r in models_df.head(5).iterrows():
         print(
@@ -552,7 +777,7 @@ def summarize_run(run_dir: Path):
 
 if __name__ == '__main__':
     _parser = argparse.ArgumentParser(
-        description='Run all 1,221 CC-entry models × 4 strike offsets across 100 windows.'
+        description='Run all 1,221 CC-variant models (12 variants each) across 100 windows.'
     )
     _parser.add_argument(
         '--seed', type=int, default=None,
@@ -584,7 +809,8 @@ if __name__ == '__main__':
 
     print(f"[main]  Master seed : {RANDOM_SEED}")
     print(f"[main]  Workers     : {N_WORKERS}")
-    print(f"[main]  Offsets     : {STRIKE_OFFSETS}")
+    print(f"[main]  Variants    : {len(OPTION_VARIANTS)} per combo  "
+          f"(w0/w1/w2 × s-2/s-1/s-0/s+0/s+1/s+2)")
 
     run_ts  = datetime.datetime.now().strftime('%m%d%H%M')
     run_dir = REPORTS_DIR / run_ts

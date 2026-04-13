@@ -1,31 +1,32 @@
 """
 single_model.py — 3_covered_calls
 
-Entry: composite 4-indicator buy signal → immediately open stock + covered call.
+Entry: composite 4-indicator buy signal → immediately open stock + 12 covered call variants.
 
 Strategy:
-  On buy signal → buy 100 shares at avg_ask + sell 1 call at a fixed strike offset.
+  On buy signal → buy 100 shares at avg_ask and simultaneously simulate selling
+  12 different call option contracts (3 expiries × 4 strikes).
 
-  Strike offsets tested (AAPL $1 grid, floor to nearest dollar):
-    +3  OTM call  (strike above entry price — limited upside, lower premium)
-    +2  OTM call
-    -2  ITM call  (strike below entry price — capped loss on stock, higher premium)
-    -3  ITM call
+  Expiries:  w0 = Friday of entry week
+             w1 = Friday of following week
+             w2 = Friday two weeks after entry week
 
-Exit:
-  1. CC ask < $0.50  → buy back call + sell stock at avg_bid  (cc_buyback)
+  Strikes (relative to floor(entry_price)):
+    s+1 = floor(entry_price) + 1
+    s+2 = floor(entry_price) + 2
+    s-1 = floor(entry_price) - 1
+    s-2 = floor(entry_price) - 2
+
+Exit (per variant):
+  1. Option ask < $0.50   → buyback — buy back call, sell stock at avg_bid
   2. Expiry Friday ≥ 15:00:
-       stock avg_bid > strike  (ITM) → assignment  (cc_assigned, stock sold at strike)
-       stock avg_bid ≤ strike  (OTM) → expired OTM, sell stock at avg_bid
+       stock avg_bid > strike (ITM) → assigned — stock sold at strike
+       stock avg_bid ≤ strike (OTM) → expired_otm — stock sold at avg_bid
+  3. Window end without resolution → window_end
 
-No stop loss.  No EOD forced exit on non-expiry days.
-Position closes only when the covered call closes.
-
-Trades CSV has a 'leg' column:
-  'stock'  — the stock position row
-  'option' — the short call row
-
-Metrics are computed at the position level (combined stock + option P&L).
+No stop loss.  Position closes only when covered call closes.
+Each of the 12 option variants is an independent simulation.
+Metrics are computed per (combo × option_variant).
 """
 
 from __future__ import annotations
@@ -43,10 +44,10 @@ import numpy as np
 import pandas as pd
 
 # ── path setup ─────────────────────────────────────────────────────────────────
-_HERE   = Path(__file__).parent
-_MODEL1 = _HERE.parent / '1a_tech_indicators_sock_trade'
-_BASE   = _HERE.parent.parent          # /feb1/
-sys.path.insert(0, str(_MODEL1))
+_HERE    = Path(__file__).parent
+_MODEL1A = _HERE.parent / '1a_tech_indicators_sock_trade'
+_BASE    = _HERE.parent.parent          # /feb1/
+sys.path.insert(0, str(_MODEL1A))
 sys.path.insert(0, str(_HERE))
 
 from signals import add_buy_signals, add_sell_signals
@@ -66,13 +67,22 @@ OPTIONS_DIR  = _BASE / 'data/options'
 N_SAMPLE              = 10_000
 RANDOM_SEED           = 42
 COMMISSION            = 2.00
-CC_BUYBACK_THRESHOLD  = 0.50   # buy back the short call if ask drops below this
-CC_MAX_EXPIRY_DAYS    = 4      # max calendar days to Friday expiration
-MAX_STRIKE_GAP        = 1.0    # max $ between floored target strike and actual strike
-MAX_QUOTE_AGE_MINUTES = 30     # freshness guard — reject stale option open quote
-EXPIRY_QUOTE_MIN_HOUR = 15     # expiry-day quote must exist at or after 3 PM
+OPTION_EXIT_PRICE     = 0.50    # buyback threshold
+MAX_QUOTE_AGE_MINUTES = 30      # freshness guard — reject stale option open quote
+EXPIRY_QUOTE_MIN_HOUR = 15      # expiry-day quote at or after 3 PM
+SHARES                = 100     # always 100 shares (fixed)
 
-STRIKE_OFFSETS = [3.0, 2.0, -2.0, -3.0]   # positive = OTM, negative = ITM
+# ── option variant definitions ─────────────────────────────────────────────────
+# Strike labels encode direction and chain-step (not a dollar offset):
+#   s-0 = first available strike strictly below entry price
+#   s-1 = next strike below s-0
+#   s-2 = next strike below s-1
+#   s+0 = first available strike strictly above entry price
+#   s+1 = next strike above s+0
+#   s+2 = next strike above s+1
+EXPIRY_WEEKS    = ['w0', 'w1', 'w2']
+STRIKE_LABELS   = ['s-2', 's-1', 's-0', 's+0', 's+1', 's+2']
+OPTION_VARIANTS = [(ew, sl) for ew in EXPIRY_WEEKS for sl in STRIKE_LABELS]   # 18 total
 
 # ── standalone run constants ───────────────────────────────────────────────────
 N_RUNS      = 100
@@ -198,104 +208,125 @@ def _has_expiry_quote(option_df: pd.DataFrame | None, expiry_date: datetime.date
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COVERED CALL LOOKUP — fixed offset at entry
+# OPTION VARIANT HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def find_cc_at_entry(
-    entry_date:    datetime.date,
-    entry_ts:      pd.Timestamp,
-    entry_price:   float,
-    strike_offset: float,
-) -> tuple[dict | None, pd.DataFrame | None]:
+def _get_expiry_friday(entry_date: datetime.date, weeks_ahead: int) -> datetime.date:
+    """Return the Friday of the week `weeks_ahead` weeks from entry_date's week."""
+    dow = entry_date.weekday()   # Mon=0, Fri=4
+    days_to_friday = (4 - dow) % 7   # 0 if already Friday
+    return entry_date + datetime.timedelta(days=days_to_friday + weeks_ahead * 7)
+
+
+def _find_strike_by_chain(
+    option_index: pd.DataFrame,
+    expiry_int:   int,
+    entry_price:  float,
+    strike_label: str,
+) -> float | None:
     """
-    Find and validate a covered call at a fixed strike offset from entry price.
+    Walk the option chain for a given expiry and return the Nth available call
+    strike above or below entry_price.
 
-    strike_offset > 0  →  OTM call  (strike above entry)
-    strike_offset < 0  →  ITM call  (strike below entry)
+    Strike label format:  s{direction}{step}
+      direction '+' → above entry_price;  '-' → below entry_price
+      step 0 = first, 1 = second, 2 = third
 
-    Strike = floor(entry_price + offset) — AAPL $1 increment grid.
+    Examples (entry_price = 175.42, chain = [172, 173, 174, 175, 176, 177, 178]):
+      s-0 → 175   (first below 175.42)
+      s-1 → 174   (second below)
+      s-2 → 173   (third below)
+      s+0 → 176   (first above 175.42)
+      s+1 → 177   (second above)
+      s+2 → 178   (third above)
+    """
+    strikes = (
+        option_index[
+            (option_index['call_put']        == 'C') &
+            (option_index['expiration_date'] == expiry_int)
+        ]['strike_price']
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+    )
+    if not strikes:
+        return None
 
-    Validates:
-      - Nearest Friday ≤ CC_MAX_EXPIRY_DAYS away
-      - Contract exists in option index; gap ≤ MAX_STRIKE_GAP
-      - Has a quote on expiry Friday at or after 15:00
-      - Has a fresh open quote at entry time (≤ MAX_QUOTE_AGE_MINUTES)
+    direction = strike_label[1]   # '+' or '-'
+    step      = int(strike_label[2])   # 0, 1, 2
 
-    Returns (contract_dict, option_df) or (None, None) if any check fails.
+    if direction == '-':
+        candidates = sorted([s for s in strikes if s < entry_price], reverse=True)
+    else:
+        candidates = sorted([s for s in strikes if s > entry_price])
+
+    return float(candidates[step]) if len(candidates) > step else None
+
+
+def find_cc_variant(
+    entry_date:   datetime.date,
+    entry_ts:     pd.Timestamp,
+    entry_price:  float,
+    expiry_label: str,    # 'w0', 'w1', 'w2'
+    strike_label: str,    # 's-2', 's-1', 's-0', 's+0', 's+1', 's+2'
+) -> dict | None:
+    """
+    Find a CC variant by walking the option chain.
+
+    Strike is selected by position relative to entry_price (not by dollar offset).
+    Does NOT gate on expiry quote existence — returns the variant if the contract
+    exists. open_price may be None if no fresh entry quote is available.
+
+    Returns a dict with all variant fields, or None if no matching strike in chain.
     """
     option_index = load_option_index()
+    weeks_ahead  = int(expiry_label[1])
+    friday       = _get_expiry_friday(entry_date, weeks_ahead)
+    expiry_int   = int(friday.strftime('%y%m%d'))
+    variant_key  = f"{expiry_label}/{strike_label}"
 
-    dow        = entry_date.weekday()
-    days_ahead = (4 - dow) % 7
-    friday     = entry_date + datetime.timedelta(days=days_ahead)
-
-    if (friday - entry_date).days > CC_MAX_EXPIRY_DAYS:
-        return None, None
-
-    expiry_int    = int(friday.strftime('%y%m%d'))
-    target_strike = math.floor(entry_price + strike_offset)
+    strike = _find_strike_by_chain(option_index, expiry_int, entry_price, strike_label)
+    if strike is None:
+        return None
 
     cands = option_index[
         (option_index['call_put']        == 'C') &
         (option_index['expiration_date'] == expiry_int) &
-        (option_index['strike_price']    <= target_strike)
+        (option_index['strike_price']    == strike)
     ]
     if cands.empty:
-        return None, None
+        return None
 
-    best_row = cands.loc[cands['strike_price'].idxmax()]
-    strike   = float(best_row['strike_price'])
-    gap      = target_strike - strike
-
-    if gap > MAX_STRIKE_GAP:
-        return None, None
-
-    contract  = best_row.to_dict()
+    contract  = cands.iloc[0].to_dict()
     option_df = load_option_data(contract)
 
-    if not _has_expiry_quote(option_df, friday):
-        return None, None
+    open_price = get_option_price_at(option_df, entry_ts, 'avg_bid', MAX_QUOTE_AGE_MINUTES)
 
-    premium = get_option_price_at(option_df, entry_ts, 'avg_bid',
-                                  max_age_minutes=MAX_QUOTE_AGE_MINUTES)
-    if premium is None:
-        return None, None
+    return {
+        'expiry_label':  expiry_label,
+        'strike_label':  strike_label,
+        'variant_key':   variant_key,
+        'contract':      contract,
+        'option_df':     option_df,
+        'strike':        strike,
+        'expiry_date':   friday,
+        'expiry_int':    expiry_int,
+        'open_price':    open_price,
+    }
 
-    return contract, option_df
 
-
-def find_cc_candidates_at_entry(
-    entry_date:    datetime.date,
-    entry_ts:      pd.Timestamp,
-    entry_price:   float,
-    strike_offsets: list[float] | None = None,
-) -> dict[float, dict]:
-    """Return all valid covered-call candidates for this entry."""
-    offsets = strike_offsets or STRIKE_OFFSETS
-    candidates: dict[float, dict] = {}
-
-    for offset in offsets:
-        contract, option_df = find_cc_at_entry(entry_date, entry_ts, entry_price, offset)
-        if contract is None or option_df is None:
-            continue
-
-        open_bid = get_option_price_at(
-            option_df, entry_ts, 'avg_bid', max_age_minutes=MAX_QUOTE_AGE_MINUTES
+def find_all_cc_variants(
+    entry_date:  datetime.date,
+    entry_ts:    pd.Timestamp,
+    entry_price: float,
+) -> dict:
+    """Return dict keyed by (expiry_label, strike_label) → variant dict or None."""
+    result = {}
+    for expiry_label, strike_label in OPTION_VARIANTS:
+        result[(expiry_label, strike_label)] = find_cc_variant(
+            entry_date, entry_ts, entry_price, expiry_label, strike_label
         )
-        if open_bid is None:
-            continue
-
-        candidates[offset] = {
-            'offset': offset,
-            'contract': contract,
-            'option_df': option_df,
-            'symbol': contract.get('localSymbol', ''),
-            'strike': float(contract.get('strike_price', 0.0)),
-            'expiry': str(contract.get('expiration_date', '')),
-            'open_price': round(float(open_bid), 4),
-        }
-
-    return candidates
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -321,25 +352,22 @@ def draw_sample(df: pd.DataFrame, seed: int = RANDOM_SEED) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EOW CONTEXT BUILDER  (entry date through Friday)
+# CONTEXT BUILDER  (entry date through end of df)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_eow_context(
+def _build_cc_context(
     df: pd.DataFrame,
     entry_global_idx: int,
 ) -> tuple[pd.DataFrame | None, int | None]:
     """
-    Build a DataFrame slice from the entry bar's trading date through that Friday.
+    Build a DataFrame slice from the entry bar through the end of df.
     Returns (df_slice, entry_iloc) with reset index, or (None, None) on failure.
     """
     trade_date = df.loc[entry_global_idx, 'fnd_trade_date']
     entry_dt   = pd.Timestamp(str(trade_date))
-    dow        = entry_dt.dayofweek
-    days_ahead = (4 - dow) % 7
-    friday_dt  = entry_dt + pd.Timedelta(days=days_ahead)
 
     fnd_ts   = pd.to_datetime(df['fnd_trade_date'])
-    mask     = (fnd_ts >= entry_dt) & (fnd_ts <= friday_dt)
+    mask     = fnd_ts >= entry_dt
     df_slice = df[mask].reset_index(drop=True)
 
     if df_slice.empty:
@@ -354,342 +382,371 @@ def _build_eow_context(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COVERED CALL SIMULATION  (entry through Friday)
+# VARIANT RESULT BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def simulate_cc_position(
-    df_eow:          pd.DataFrame,
-    entry_iloc:      int,
-    option_df:       pd.DataFrame,
-    option_contract: dict,
+def _build_result(
+    variant:         dict,
+    bar:             pd.Series,
+    cc_close_reason: str,
+    cc_close_price:  float | None,
+    bars_held:       int,
     entry_price:     float,
     shares:          int,
-    cc_candidates:   dict[float, dict] | None = None,
-    capture_evals:   bool = False,
-) -> tuple[dict | None, dict | None]:
+    stock_override:  float | None = None,
+) -> dict:
+    """Build a result dict for a closed variant."""
+    stock_exit_price = stock_override if stock_override is not None else float(bar['avg_bid'])
+    stock_pnl = shares * stock_exit_price - shares * entry_price - COMMISSION
+
+    if variant['open_price'] is not None and cc_close_price is not None:
+        opt_pnl      = (variant['open_price'] - cc_close_price) * shares - COMMISSION
+        combined_pnl = stock_pnl + opt_pnl
+        is_winner    = combined_pnl > 0
+        data_status  = 'ok'
+    else:
+        opt_pnl      = None
+        combined_pnl = None
+        is_winner    = None
+        data_status  = 'no_open_price' if variant['open_price'] is None else 'no_close_price'
+
+    cc_close_time  = str(bar['date'])
+    stock_exit_time = str(bar['date'])
+
+    return {
+        'variant_key':        variant['variant_key'],
+        'expiry_label':       variant['expiry_label'],
+        'strike_label':       variant['strike_label'],
+        'strike':             variant['strike'],
+        'expiry_date':        variant['expiry_date'],
+        'open_price':         variant['open_price'],
+        'cc_close_price':     cc_close_price,
+        'cc_close_reason':    cc_close_reason,
+        'cc_close_time':      cc_close_time,
+        'stock_exit_price':   round(stock_exit_price, 4),
+        'stock_exit_reason':  cc_close_reason,
+        'stock_exit_time':    stock_exit_time,
+        'bars_held':          bars_held,
+        'shares':             shares,
+        'stock_pnl':          round(stock_pnl, 2),
+        'option_pnl':         round(opt_pnl, 2) if opt_pnl is not None else None,
+        'combined_pnl':       round(combined_pnl, 2) if combined_pnl is not None else None,
+        'is_winner':          is_winner,
+        'data_status':        data_status,
+    }
+
+
+def _not_found_result(expiry_label: str, strike_label: str) -> dict:
+    """Result dict for a variant where no contract was found."""
+    variant_key = f"{expiry_label}/{strike_label}"
+    return {
+        'variant_key':       variant_key,
+        'expiry_label':      expiry_label,
+        'strike_label':      strike_label,
+        'strike':            None,
+        'expiry_date':       None,
+        'open_price':        None,
+        'cc_close_price':    None,
+        'cc_close_reason':   'no_contract',
+        'cc_close_time':     None,
+        'stock_exit_price':  None,
+        'stock_exit_reason': None,
+        'stock_exit_time':   None,
+        'bars_held':         None,
+        'shares':            None,
+        'stock_pnl':         None,
+        'option_pnl':        None,
+        'combined_pnl':      None,
+        'is_winner':         None,
+        'data_status':       'no_contract',
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE MULTI-VARIANT SIMULATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def simulate_all_variants(
+    df_slice:      pd.DataFrame,
+    entry_iloc:    int,
+    all_variants:  dict,
+    entry_price:   float,
+    shares:        int,
+    capture_evals: bool = False,
+) -> tuple[dict, list]:
     """
-    Open covered call at the entry bar, walk forward through Friday.
+    Walk forward through df_slice once, handling all 12 variants simultaneously.
 
-    Stock exit reasons:
-      cc_buyback      — option ask fell below $0.50; stock sold at avg_bid
-      cc_assigned     — option expired ITM; stock sold at strike price
-      cc_expired_otm  — option expired OTM; stock sold at avg_bid
-
-    Returns (stock_leg_dict, option_leg_dict) or (None, None) if the open
-    premium is unavailable at entry.
+    Returns (variant_results, evals):
+      variant_results: dict keyed by (expiry_label, offset) -> result dict
+      evals: list of per-bar eval dicts (only if capture_evals=True)
     """
-    strike    = float(option_contract['strike_price'])
-    entry_bar = df_eow.iloc[entry_iloc]
-    entry_ts  = pd.Timestamp(entry_bar['date'])
+    open_variants  = {k: v for k, v in all_variants.items() if v is not None}
+    closed_results = {}
+    evals          = []
 
-    cc_open_price = get_option_price_at(option_df, entry_ts, 'avg_bid',
-                                        max_age_minutes=MAX_QUOTE_AGE_MINUTES)
-    if cc_open_price is None:
-        return None, None
-
-    cc_close_price    = None
-    cc_close_reason   = None
-    cc_close_time     = None
-    stock_exit_price  = None
-    stock_exit_reason = None
-    stock_exit_time   = None
-    stock_close_bid   = None
-    cc_bars = 0
-    evals   = []
-    candidates = cc_candidates or {}
-
-    for i in range(entry_iloc + 1, len(df_eow)):
-        bar      = df_eow.iloc[i]
+    for i in range(entry_iloc + 1, len(df_slice)):
+        bar      = df_slice.iloc[i]
         bar_time = pd.Timestamp(bar['date'])
-        cc_bars += 1
+        bar_date = bar_time.date()
+        bar_number = i - entry_iloc   # bars_held counter
 
-        if capture_evals:
+        if capture_evals and open_variants:
             eval_row = {
-                'eval_time': str(bar['date']),
-                'stock_avg': round(float(bar['average']), 4),
-                'asks': {},
+                'time':      str(bar['date']).split(' ')[-1] if ' ' in str(bar['date']) else str(bar['date']),
+                'stock_wap': round(float(bar['average']), 2),
+                'asks':      {},
             }
-            for off, cand in candidates.items():
-                ask = get_option_price_at(
-                    cand['option_df'], bar_time, 'avg_ask',
-                    max_age_minutes=MAX_QUOTE_AGE_MINUTES,
+            for key, variant in open_variants.items():
+                opt_ask = get_option_price_at(
+                    variant['option_df'], bar_time, 'avg_ask', MAX_QUOTE_AGE_MINUTES
                 )
-                eval_row['asks'][off] = round(float(ask), 4) if ask is not None else None
+                eval_row['asks'][variant['variant_key']] = (
+                    round(float(opt_ask), 2) if opt_ask is not None else None
+                )
             evals.append(eval_row)
 
-        opt_ask = get_option_price_at(option_df, bar_time, 'avg_ask',
-                                      max_age_minutes=MAX_QUOTE_AGE_MINUTES)
-        if opt_ask is not None and opt_ask < CC_BUYBACK_THRESHOLD:
-            cc_close_price    = opt_ask
-            cc_close_reason   = 'buyback'
-            cc_close_time     = str(bar['date'])
-            stock_exit_price  = float(bar['avg_bid'])
-            stock_exit_reason = 'cc_buyback'
-            stock_exit_time   = str(bar['date'])
-            stock_close_bid   = float(bar['avg_bid'])
+        for key in list(open_variants.keys()):
+            variant = open_variants[key]
+
+            opt_ask = get_option_price_at(
+                variant['option_df'], bar_time, 'avg_ask', MAX_QUOTE_AGE_MINUTES
+            )
+
+            # Buyback check
+            if opt_ask is not None and opt_ask < OPTION_EXIT_PRICE:
+                closed_results[key] = _build_result(
+                    variant, bar, 'buyback', opt_ask, bar_number, entry_price, shares
+                )
+                del open_variants[key]
+                continue
+
+            # Expiry check: at or after EXPIRY_QUOTE_MIN_HOUR on expiry_date
+            expiry_threshold = pd.Timestamp(variant['expiry_date']) + pd.Timedelta(hours=EXPIRY_QUOTE_MIN_HOUR)
+            if bar_time >= expiry_threshold:
+                stock_bid = float(bar['avg_bid'])
+                if stock_bid > variant['strike']:
+                    closed_results[key] = _build_result(
+                        variant, bar, 'assigned', 0.0, bar_number, entry_price, shares,
+                        stock_override=variant['strike']
+                    )
+                else:
+                    closed_results[key] = _build_result(
+                        variant, bar, 'expired_otm', 0.0, bar_number, entry_price, shares
+                    )
+                del open_variants[key]
+                continue
+
+        if not open_variants:
             break
 
-    if cc_close_price is None:
-        # End-of-week close — check ITM vs OTM
-        last            = df_eow.iloc[-1]
-        stock_close_bid = float(last['avg_bid'])
-        cc_close_time   = str(last['date'])
-        stock_exit_time = str(last['date'])
-        cc_close_price  = 0.0
+    # Window end: close remaining open variants
+    last      = df_slice.iloc[-1]
+    last_time = pd.Timestamp(last['date'])
+    last_bar_number = len(df_slice) - 1 - entry_iloc
 
-        if stock_close_bid > strike:
-            stock_exit_price  = strike
-            stock_exit_reason = 'cc_assigned'
-            cc_close_reason   = 'assigned'
-        else:
-            stock_exit_price  = stock_close_bid
-            stock_exit_reason = 'cc_expired_otm'
-            cc_close_reason   = 'expired_otm'
-
-    # ── Stock leg ──────────────────────────────────────────────────────────────
-    cost      = shares * entry_price
-    proceeds  = shares * stock_exit_price
-    stock_pnl = proceeds - cost - COMMISSION
-    stock_pct = stock_pnl / cost * 100 if cost > 0 else 0.0
-
-    stock_leg = {
-        'exit_price':       round(stock_exit_price, 4),
-        'exit_time':        stock_exit_time,
-        'exit_reason':      stock_exit_reason,
-        'bars_held':        cc_bars,
-        'shares':           shares,
-        'cost':             round(cost, 2),
-        'proceeds':         round(proceeds, 2),
-        'pnl_dollar':       round(stock_pnl, 2),
-        'pnl_pct':          round(stock_pct, 4),
-        'is_winner':        stock_pnl > 0,
-        'cc_option_symbol': option_contract.get('localSymbol', ''),
-        'cc_strike':        strike,
-        'cc_expiry':        str(option_contract.get('expiration_date', '')),
-        'cc_open_time':     str(entry_ts),
-        'cc_open_price':    round(cc_open_price, 4),
-        '_evals':           evals,
-        '_cc_candidates':   [
-            {
-                'offset': off,
-                'symbol': cand['symbol'],
-                'strike': cand['strike'],
-                'expiry': cand['expiry'],
-                'open_price': cand['open_price'],
-                'selected': cand['symbol'] == option_contract.get('localSymbol', ''),
-            }
-            for off, cand in sorted(candidates.items(), reverse=True)
-        ],
-    }
-
-    # ── Option leg ─────────────────────────────────────────────────────────────
-    # Short call: collected premium at open, paid cc_close_price to close (or 0 at expiry)
-    opt_pnl = (cc_open_price - cc_close_price) * shares - COMMISSION
-
-    option_leg = {
-        'entry_time':       str(entry_ts),
-        'entry_price':      round(cc_open_price, 4),
-        'exit_time':        cc_close_time,
-        'exit_price':       round(cc_close_price, 4),
-        'exit_reason':      cc_close_reason,
-        'bars_held':        cc_bars,
-        'shares':           shares,
-        'cost':             round(cc_open_price * shares, 2),
-        'proceeds':         round(cc_close_price * shares, 2),
-        'pnl_dollar':       round(opt_pnl, 2),
-        'pnl_pct':          0.0,
-        'is_winner':        opt_pnl > 0,
-        'cc_option_symbol': option_contract.get('localSymbol', ''),
-        'cc_strike':        strike,
-        'cc_expiry':        str(option_contract.get('expiration_date', '')),
-    }
-
-    candidate_close = []
-    close_ts = pd.Timestamp(cc_close_time)
-    for off, cand in sorted(candidates.items(), reverse=True):
-        close_ask = None
-        if cc_close_reason == 'buyback':
-            close_ask = get_option_price_at(
-                cand['option_df'], close_ts, 'avg_ask',
-                max_age_minutes=MAX_QUOTE_AGE_MINUTES,
+    for key, variant in open_variants.items():
+        # Try late buyback data
+        late_ask = get_option_price_at(variant['option_df'], last_time, 'avg_ask')
+        if late_ask is not None and late_ask < OPTION_EXIT_PRICE:
+            closed_results[key] = _build_result(
+                variant, last, 'buyback_late_data', late_ask,
+                last_bar_number, entry_price, shares
             )
         else:
-            close_ask = 0.0
+            # Use closing bid if available, else None
+            close_bid = get_option_price_at(variant['option_df'], last_time, 'avg_bid')
+            closed_results[key] = _build_result(
+                variant, last, 'window_end', close_bid,
+                last_bar_number, entry_price, shares
+            )
 
-        option_pnl = None
-        stock_exit = None
-        combined_pnl = None
-        if close_ask is not None:
-            option_pnl = (cand['open_price'] - float(close_ask)) * shares - COMMISSION
-            if cc_close_reason == 'buyback':
-                stock_exit = float(stock_close_bid)
-            else:
-                stock_exit = cand['strike'] if float(stock_close_bid) > cand['strike'] else float(stock_close_bid)
+    # Add not-found variants
+    for key in OPTION_VARIANTS:
+        if key not in closed_results:
+            expiry_label, strike_label = key
+            closed_results[key] = _not_found_result(expiry_label, strike_label)
 
-            stock_pnl_candidate = shares * stock_exit - shares * entry_price - COMMISSION
-            combined_pnl = stock_pnl_candidate + option_pnl
-
-        candidate_close.append({
-            'offset': off,
-            'symbol': cand['symbol'],
-            'strike': cand['strike'],
-            'expiry': cand['expiry'],
-            'open_price': cand['open_price'],
-            'close_price': round(float(close_ask), 4) if close_ask is not None else None,
-            'option_pnl': round(float(option_pnl), 2) if option_pnl is not None else None,
-            'combined_pnl': round(float(combined_pnl), 2) if combined_pnl is not None else None,
-            'selected': cand['symbol'] == option_contract.get('localSymbol', ''),
-        })
-    stock_leg['_cc_candidate_close'] = candidate_close
-
-    return stock_leg, option_leg
+    return closed_results, evals
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LOG WRITERS
+# LOG WRITERS — TABLE FORMAT
 # ══════════════════════════════════════════════════════════════════════════════
 
-_LOG_WIDTH    = 72
 _LOG_EVAL_HEAD = 5
 _LOG_EVAL_TAIL = 5
 
+# Ordered variant keys for display
+_VARIANT_DISPLAY_ORDER = list(OPTION_VARIANTS)
 
-def _ruler(label: str) -> str:
-    return label + '-' * max(0, _LOG_WIDTH - len(label))
+
+def _fw(val, width: int, align: str = 'left') -> str:
+    """Format a value to fixed width."""
+    s = str(val) if val is not None else 'N/A'
+    if align == 'right':
+        return s.rjust(width)
+    elif align == 'center':
+        return s.center(width)
+    return s.ljust(width)
+
+
+def _log_trade_table(
+    fh,
+    trade_no:        int,
+    indicators:      dict,
+    entry_snapshot:  dict,
+    variant_results: dict,
+    evals:           list,
+):
+    """Write a trade to the log in ASCII table format."""
+    t   = indicators['trend'].upper()
+    m   = indicators['momentum'].upper()
+    v   = indicators['volatility'].upper()
+    vol = indicators['volume'].upper()
+    combo_str    = f"{t}+{m}+{v}+{vol}"
+    entry_time   = entry_snapshot['entry_time']
+    entry_price  = entry_snapshot['entry_price']
+    shares       = entry_snapshot['shares']
+    atr_val      = entry_snapshot.get('atr_at_entry', 'N/A')
+    rsi_val      = entry_snapshot.get('rsi_at_entry', 'N/A')
+    adx_val      = entry_snapshot.get('adx_at_entry', 'N/A')
+    vwap_val     = entry_snapshot.get('vwap_at_entry', 'N/A')
+
+    def _fmt_num(v, fmt='.2f'):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return 'N/A'
+        try:
+            return format(float(v), fmt)
+        except (TypeError, ValueError):
+            return str(v)
+
+    fh.write('\n' + '=' * 80 + '\n')
+    fh.write(
+        f" TRADE #{trade_no}  |  {combo_str}  |"
+        f"  Entry: {entry_time}  |  ${entry_price} x {shares}sh\n"
+    )
+    fh.write('=' * 80 + '\n')
+    fh.write(
+        f" ATR: {_fmt_num(atr_val)}   RSI: {_fmt_num(rsi_val)}"
+        f"   ADX: {_fmt_num(adx_val)}   VWAP: ${_fmt_num(vwap_val)}\n"
+    )
+
+    # ── Option matrix at entry ─────────────────────────────────────────────────
+    fh.write('\n OPTION MATRIX AT ENTRY:\n')
+    fh.write(' +----------+--------+--------+-----------+\n')
+    fh.write(' | Variant  | Expiry | Strike | Open Bid  |\n')
+    fh.write(' +----------+--------+--------+-----------+\n')
+    for key in _VARIANT_DISPLAY_ORDER:
+        res = variant_results.get(key)
+        if res is None:
+            variant_key  = f"{key[0]}/{key[1]}"
+            expiry_str   = '--'
+            strike_str   = '--'
+            open_bid_str = 'N/A'
+        else:
+            variant_key  = res['variant_key']
+            expiry_str   = str(res['expiry_date'].strftime('%y%m%d')) if res['expiry_date'] else '--'
+            strike_str   = _fmt_num(res['strike'], '.2f') if res['strike'] is not None else '--'
+            op           = res['open_price']
+            open_bid_str = f"{op:>9.2f}" if op is not None else '       N/A'
+        fh.write(
+            f" | {_fw(variant_key, 8)} | {_fw(expiry_str, 6)} "
+            f"| {_fw(strike_str, 6)} | {_fw(open_bid_str, 9)} |\n"
+        )
+    fh.write(' +----------+--------+--------+-----------+\n')
+
+    # ── Price evals (first 5 / last 5) ────────────────────────────────────────
+    if evals:
+        # Collect all variant keys that appear in evals
+        all_vkeys = []
+        for key in _VARIANT_DISPLAY_ORDER:
+            vkey = f"{key[0]}/{key[1]}"
+            all_vkeys.append(vkey)
+
+        # Build header
+        col_w = 8
+        time_w = 20
+        stock_w = 8
+        header_row = f" | {'Time':<{time_w}} | {'Stock':<{stock_w}} |"
+        for vk in all_vkeys:
+            header_row += f" {_fw(vk, col_w)} |"
+        sep = ' +' + '-' * (time_w + 2) + '+' + '-' * (stock_w + 2) + '+' + ('-' * (col_w + 2) + '+') * len(all_vkeys)
+
+        fh.write('\n PRICE EVALS (first 5 / last 5 bars):\n')
+        fh.write(sep + '\n')
+        fh.write(header_row + '\n')
+        fh.write(sep + '\n')
+
+        def _write_eval_row(er):
+            t_str    = _fw(er['time'], time_w)
+            stk_str  = _fw(f"{er['stock_wap']:.2f}", stock_w)
+            row      = f" | {t_str} | {stk_str} |"
+            for vk in all_vkeys:
+                ask = er['asks'].get(vk)
+                ask_str = f"{ask:.2f}" if ask is not None else 'N/A'
+                row += f" {_fw(ask_str, col_w)} |"
+            fh.write(row + '\n')
+
+        head = evals[:_LOG_EVAL_HEAD]
+        tail = evals[-_LOG_EVAL_TAIL:] if len(evals) > _LOG_EVAL_HEAD + _LOG_EVAL_TAIL else []
+        skip = len(evals) - len(head) - len(tail)
+
+        for er in head:
+            _write_eval_row(er)
+        if skip > 0:
+            skip_row = f" | {'... ' + str(skip) + ' rows skipped':<{time_w}} |" + ' ' * (stock_w + 2) + '|'
+            for _ in all_vkeys:
+                skip_row += ' ' * (col_w + 2) + '|'
+            fh.write(skip_row + '\n')
+        for er in tail:
+            _write_eval_row(er)
+        fh.write(sep + '\n')
+
+    # ── Results table ──────────────────────────────────────────────────────────
+    fh.write('\n RESULTS:\n')
+    fh.write(' +----------+---------------------+--------------+---------+---------+---------+-------+\n')
+    fh.write(' | Variant  | Exit Time           | Exit Reason  | Stock$  | Option$ | Total$  |  Win? |\n')
+    fh.write(' +----------+---------------------+--------------+---------+---------+---------+-------+\n')
+    for key in _VARIANT_DISPLAY_ORDER:
+        res = variant_results.get(key)
+        if res is None:
+            variant_key  = f"{key[0]}/{key[1]}"
+            exit_time    = _fw('N/A', 19)
+            exit_reason  = _fw('N/A', 12)
+            stock_str    = _fw('N/A', 7, 'right')
+            opt_str      = _fw('N/A', 7, 'right')
+            total_str    = _fw('N/A', 7, 'right')
+            win_str      = _fw('N/A', 5, 'center')
+        else:
+            variant_key = res['variant_key']
+            et          = res.get('cc_close_time') or 'N/A'
+            exit_time   = _fw(et, 19)
+            exit_reason = _fw(res['cc_close_reason'], 12)
+
+            sp = res['stock_pnl']
+            op = res['option_pnl']
+            tp = res['combined_pnl']
+
+            stock_str = _fw((f"+{sp:.2f}" if sp >= 0 else f"{sp:.2f}") if sp is not None else 'N/A', 7, 'right')
+            opt_str   = _fw((f"+{op:.2f}" if op >= 0 else f"{op:.2f}") if op is not None else 'N/A', 7, 'right')
+            total_str = _fw((f"+{tp:.2f}" if tp >= 0 else f"{tp:.2f}") if tp is not None else 'N/A', 7, 'right')
+            iw        = res['is_winner']
+            win_str   = _fw('YES' if iw is True else ('NO' if iw is False else 'N/A'), 5, 'center')
+
+        fh.write(
+            f" | {_fw(variant_key, 8)} | {exit_time} | {exit_reason} |"
+            f" {stock_str} | {opt_str} | {total_str} | {win_str} |\n"
+        )
+    fh.write(' +----------+---------------------+--------------+---------+---------+---------+-------+\n')
+    fh.write('\n')
 
 
 def _log_model_start(fh, seq_no, model_id, t, m, v, vol):
     header = f"-----  START:  seq_no: [{seq_no}] model_id: [{model_id}]  "
-    fh.write(f"\n{_ruler(header)}\n")
+    fh.write(f"\n{header + '-' * max(0, 72 - len(header))}\n")
     fh.write(f"trend: [{t}] momentum: [{m}] volatility: [{v}] volume: [{vol}]\n")
     fh.write("\n----- Details\n\n")
-
-
-def _write_evals(fh, header: str, rows: list, fmt):
-    if not rows:
-        return
-    fh.write(f"    {header}\n")
-    head = rows[:_LOG_EVAL_HEAD]
-    tail = rows[_LOG_EVAL_TAIL * -1:] if len(rows) > _LOG_EVAL_HEAD + _LOG_EVAL_TAIL else []
-    skip = len(rows) - len(head) - len(tail)
-    for r in head:
-        fh.write(fmt(r))
-    if skip > 0:
-        fh.write(f"    ... {skip} bars skipped ...\n")
-    for r in tail:
-        fh.write(fmt(r))
-    fh.write("\n")
-
-
-def _log_trade(fh, tr):
-    offset_str = f"{tr['strike_offset']:+.0f}"
-    fh.write(
-        f"trade_no: [{tr['trade_no']}], "
-        f"entry_time: [{tr['entry_time']}] "
-        f"entry_price: [{tr['entry_price']}]\n"
-    )
-    fh.write(
-        f"strike_offset: [{offset_str}]  "
-        f"strike: [{tr.get('strike', '')}]  "
-        f"cc_symbol: [{tr.get('cc_option_symbol', '')}]  "
-        f"cc_expiry: [{tr.get('cc_expiry', '')}]\n"
-    )
-    fh.write(
-        f"cc_open_time: [{tr.get('cc_open_time', '')}]  "
-        f"cc_open_price: [{tr.get('cc_open_price', '')}]  "
-        f"(buyback threshold: {CC_BUYBACK_THRESHOLD})\n"
-    )
-    fh.write(
-        f"atr_at_entry: [{tr['atr_at_entry']}]  "
-        f"rsi_at_entry: [{tr['rsi_at_entry']}]\n"
-    )
-    fh.write(
-        f"adx_at_entry: [{tr['adx_at_entry']}]  "
-        f"vwap_at_entry: [{tr['vwap_at_entry']}]\n"
-    )
-    fh.write("\n")
-
-    cc_candidates = tr.get('_cc_candidates', [])
-    if cc_candidates:
-        fh.write("    options_considered\n")
-        for cand in cc_candidates:
-            sel = " selected" if cand.get('selected') else ""
-            fh.write(
-                f"    offset: [{cand['offset']:+.0f}]  strike: [{cand['strike']}]  "
-                f"ask_at_open: [{cand['open_price']}]  symbol: [{cand['symbol']}]  "
-                f"expiry: [{cand['expiry']}]{sel}\n"
-            )
-        fh.write("\n")
-
-    cc_evals = tr.get('_cc_evals', [])
-
-    def _fmt_cc(r):
-        t = str(r['eval_time']).split(' ')[-1] if ' ' in str(r['eval_time']) else str(r['eval_time'])
-        stock_avg = f"{r['stock_avg']:.2f}"
-
-        def _fmt_ask(off: float) -> str:
-            ask = r.get('asks', {}).get(off)
-            return 'NA' if ask is None else f"{ask:.2f}"
-
-        return (
-            f"    {t}  {stock_avg:>6}  "
-            f"{_fmt_ask(3.0):>5}  {_fmt_ask(2.0):>5}  "
-            f"{_fmt_ask(-2.0):>5}  {_fmt_ask(-3.0):>5}\n"
-        )
-
-    _write_evals(
-        fh,
-        "time         stk      p3     p2     m2     m3",
-        cc_evals,
-        _fmt_cc,
-    )
-
-    fh.write(
-        f"exit_time: [{tr['exit_time']}]  "
-        f"exit_price: [{tr['exit_price']}]  "
-        f"exit_reason: [{tr['exit_reason']}]  "
-        f"bars_held: [{tr['bars_held']}]\n"
-    )
-    fh.write(
-        f"shares: [{tr['shares']}]  "
-        f"cost: [{tr['cost']}]  "
-        f"proceeds: [{tr['proceeds']}]\n"
-    )
-
-    stock_pnl = tr['pnl_dollar']
-    opt_pnl   = tr.get('_opt_pnl')
-
-    if opt_pnl is not None:
-        combined     = round(stock_pnl + opt_pnl, 2)
-        cost         = tr['cost']
-        combined_pct = round(combined / cost * 100 if cost else 0.0, 4)
-        fh.write(
-            f"stock_sub_total: [{stock_pnl}]  "
-            f"covered_call_sub_total: [{opt_pnl}]  "
-            f"pnl_total: [{combined}]  pnl_pct: [{combined_pct}]  "
-            f"is_winner: [{'TRUE' if combined > 0 else 'FALSE'}]\n\n"
-        )
-    else:
-        fh.write(
-            f"pnl_dollar: [{stock_pnl}]  "
-            f"pnl_pct: [{tr['pnl_pct']}]  "
-            f"is_winner: [{'TRUE' if tr['is_winner'] else 'FALSE'}]\n\n"
-        )
-
-    candidate_close = tr.get('_cc_candidate_close', [])
-    if candidate_close:
-        fh.write("    possible_close_pnl_by_option\n")
-        for cand in candidate_close:
-            sel = " selected" if cand.get('selected') else ""
-            close_price = 'NA' if cand['close_price'] is None else cand['close_price']
-            option_pnl = 'NA' if cand['option_pnl'] is None else cand['option_pnl']
-            combined_pnl = 'NA' if cand['combined_pnl'] is None else cand['combined_pnl']
-            fh.write(
-                f"    offset: [{cand['offset']:+.0f}]  strike: [{cand['strike']}]  "
-                f"close_ask: [{close_price}]  option_pnl: [{option_pnl}]  "
-                f"combined_pnl: [{combined_pnl}]  symbol: [{cand['symbol']}]{sel}\n"
-            )
-        fh.write("\n")
 
 
 def _log_model_end(fh, seq_no, model_id, metrics):
@@ -713,7 +770,7 @@ def _log_model_end(fh, seq_no, model_id, metrics):
         f"max_drawdown: [{metrics['max_drawdown']}]\n"
     )
     footer = f"\n-----  END:  seq_no: {seq_no}, model_id: {model_id},  "
-    fh.write(f"{_ruler(footer)}\n")
+    fh.write(f"{footer + '-' * max(0, 72 - len(footer))}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -794,6 +851,27 @@ def _calc_metrics(positions: list[dict]) -> dict:
     }
 
 
+def _calc_variant_metrics(
+    positions: list[dict],
+    variant_key: str,
+    expiry_label: str,
+    strike_label: str,
+) -> dict:
+    """Compute metrics for a single variant's positions."""
+    valid = [p for p in positions if p.get('combined_pnl') is not None and p.get('is_winner') is not None]
+    if not valid:
+        em = _empty_metrics('no_valid_positions')
+        em['variant_key']  = variant_key
+        em['expiry_label'] = expiry_label
+        em['strike_label'] = strike_label
+        return em
+    m = _calc_metrics(valid)
+    m['variant_key']  = variant_key
+    m['expiry_label'] = expiry_label
+    m['strike_label'] = strike_label
+    return m
+
+
 def _empty_metrics(status: str) -> dict:
     return {
         'n_trades': 0, 'win_rate': 0.0,
@@ -805,7 +883,7 @@ def _empty_metrics(status: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CORE SIMULATION — one indicator combo + one strike offset
+# CORE SIMULATION — one indicator combo, all 12 variants
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_combo(
@@ -814,15 +892,21 @@ def run_combo(
     day_dict:      dict,
     day_pos_map:   dict,
     indicators:    dict[str, str],
-    strike_offset: float,
     capture_evals: bool = False,
-) -> tuple[dict, list[dict]]:
+) -> tuple[dict, list[dict], list[dict]]:
     """
-    Fire the composite buy signal, open stock + CC at entry, simulate to close.
-    Returns (metrics, trades_list).
-    trades_list rows include a 'leg' field: 'stock' or 'option'.
-    Metrics are computed from combined (stock + option) P&L per position.
-    If no option is available for the requested offset, that signal is skipped.
+    Fire the composite buy signal, open stock + all 12 CC variants at entry,
+    simulate each variant to close.
+
+    Returns (metrics_dict, trades_list, positions_list).
+
+    trades_list: flat list — for each entry × each of 12 variants:
+      - one row with leg='stock'
+      - one row with leg='option' (skipped if open_price is None)
+
+    positions_list: one row per entry × variant that has combined_pnl is not None
+
+    metrics_dict: aggregated across ALL variants with valid combined_pnl
     """
     active   = {cat: ind for cat, ind in indicators.items() if ind}
     buy_cols = [f'bsig_{ind}' for ind in active.values()]
@@ -833,54 +917,18 @@ def run_combo(
         if bc in sample_df.columns:
             composite &= sample_df[bc].astype(bool)
 
-    fired_idx = sample_df.index[composite].tolist()
-    positions  = []
-    trades     = []
+    fired_idx  = sample_df.index[composite].tolist()
+    positions  = []   # combined_pnl-valid entries for aggregate metrics
+    trades     = []   # flat trade rows (stock + option legs)
+    pos_list   = []   # per-entry × variant position rows
     trade_no   = 0
 
     for idx in fired_idx:
-        row         = df.loc[idx]
-        entry_price = float(row['avg_ask'])
-        shares      = 100
-
-        entry_ts   = pd.Timestamp(row['date'])
-        entry_date = entry_ts.date()
-        trade_date = row['fnd_trade_date']
-
-        cc_candidates = (
-            find_cc_candidates_at_entry(entry_date, entry_ts, entry_price)
-            if capture_evals else {}
-        )
-
-        # ── Find CC at fixed offset ────────────────────────────────────────────
-        if capture_evals:
-            selected = cc_candidates.get(strike_offset)
-            contract = selected['contract'] if selected else None
-            option_df = selected['option_df'] if selected else None
-        else:
-            contract, option_df = find_cc_at_entry(
-                entry_date, entry_ts, entry_price, strike_offset
-            )
-        if contract is None:
-            continue   # no valid option at this offset → skip bar
-
-        strike = float(contract['strike_price'])
-
-        # ── Build entry-to-Friday stock slice ─────────────────────────────────
-        df_eow, entry_iloc_eow = _build_eow_context(df, idx)
-        if df_eow is None or entry_iloc_eow is None:
-            continue
-
-        # ── Simulate CC position ───────────────────────────────────────────────
-        stock_leg, opt_leg = simulate_cc_position(
-            df_eow, entry_iloc_eow, option_df, contract,
-            entry_price, shares, cc_candidates, capture_evals,
-        )
-        if stock_leg is None:
-            continue
-
-        trade_no    += 1
-        combined_pnl = stock_leg['pnl_dollar'] + opt_leg['pnl_dollar']
+        row          = df.loc[idx]
+        entry_price  = float(row['avg_ask'])
+        entry_ts     = pd.Timestamp(row['date'])
+        entry_date   = entry_ts.date()
+        trade_date   = row['fnd_trade_date']
 
         atr_val  = row.get('atr_14',   np.nan)
         rsi_val  = row.get('rsi_14',   np.nan)
@@ -890,49 +938,142 @@ def run_combo(
         entry_snapshot = {
             'entry_time':    str(row['date']),
             'entry_price':   round(entry_price, 4),
-            'strike_offset': strike_offset,
-            'strike':        strike,
+            'shares':        SHARES,
             'atr_at_entry':  round(float(atr_val)  if pd.notna(atr_val)  else np.nan, 4),
             'rsi_at_entry':  round(float(rsi_val)  if pd.notna(rsi_val)  else np.nan, 4),
             'adx_at_entry':  round(float(adx_val)  if pd.notna(adx_val)  else np.nan, 4),
             'vwap_at_entry': round(float(vwap_val) if pd.notna(vwap_val) else np.nan, 4),
         }
 
-        cc_evals = stock_leg.pop('_evals', [])
-        cc_candidates_log = stock_leg.pop('_cc_candidates', [])
-        cc_candidate_close = stock_leg.pop('_cc_candidate_close', [])
-        stock_leg['_opt_pnl']  = opt_leg['pnl_dollar']
+        # Find all 12 variants
+        all_variants = find_all_cc_variants(entry_date, entry_ts, entry_price)
 
-        positions.append({
-            'combined_pnl': combined_pnl,
-            'entry_price':  entry_price,
-            'exit_price':   stock_leg['exit_price'],
-            'bars_held':    stock_leg['bars_held'],
-            'is_winner':    combined_pnl > 0,
-            'entry_time':   str(row['date']),
-        })
+        # Build context slice from entry day through end of df
+        df_slice, entry_iloc = _build_cc_context(df, idx)
+        if df_slice is None or entry_iloc is None:
+            continue
+
+        # Simulate all variants in one forward walk
+        variant_results, evals = simulate_all_variants(
+            df_slice, entry_iloc, all_variants, entry_price, SHARES,
+            capture_evals=capture_evals,
+        )
+
+        trade_no += 1
 
         base = {
             'trade_no':   trade_no,
             'trade_date': str(trade_date),
-            **{cat: indicators.get(cat, '')
-               for cat in ['trend', 'momentum', 'volatility', 'volume']},
+            **{cat: indicators.get(cat, '') for cat in ['trend', 'momentum', 'volatility', 'volume']},
             **entry_snapshot,
         }
-        trades.append({
-            **base,
-            'leg': 'stock',
-            **stock_leg,
-            '_cc_evals': cc_evals,
-            '_cc_candidates': cc_candidates_log,
-            '_cc_candidate_close': cc_candidate_close,
-        })
-        trades.append({**base, 'leg': 'option', **opt_leg})
+
+        # Emit trade rows and position rows for each variant
+        for key in OPTION_VARIANTS:
+            expiry_label, strike_label = key
+            res = variant_results.get(key)
+            if res is None:
+                res = _not_found_result(expiry_label, strike_label)
+
+            variant_key    = res['variant_key']
+            combined_pnl   = res['combined_pnl']
+            is_winner      = res['is_winner']
+            stock_pnl      = res['stock_pnl']
+            option_pnl     = res['option_pnl']
+            open_price     = res['open_price']
+            cc_close_price = res['cc_close_price']
+            exit_time      = res.get('cc_close_time') or res.get('stock_exit_time')
+            exit_price     = res.get('stock_exit_price')
+            exit_reason    = res.get('cc_close_reason')
+            bars_held      = res['bars_held']
+            strike         = res['strike']
+            expiry_date    = res['expiry_date']
+            data_status    = res['data_status']
+
+            # Stock leg
+            stock_cost     = SHARES * entry_price if exit_price is not None else None
+            stock_proceeds = SHARES * exit_price  if exit_price is not None else None
+
+            trades.append({
+                **base,
+                'leg':          'stock',
+                'variant_key':  variant_key,
+                'expiry_label': expiry_label,
+                'strike_label': strike_label,
+                'strike':       strike,
+                'expiry_date':  str(expiry_date) if expiry_date else None,
+                'cc_open_price': open_price,
+                'exit_time':    exit_time,
+                'exit_price':   exit_price,
+                'exit_reason':  exit_reason,
+                'bars_held':    bars_held,
+                'shares':       SHARES,
+                'cost':         round(stock_cost, 2) if stock_cost is not None else None,
+                'proceeds':     round(stock_proceeds, 2) if stock_proceeds is not None else None,
+                'pnl_dollar':   stock_pnl,
+                'option_pnl':   option_pnl,
+                'combined_pnl': combined_pnl,
+                'is_winner':    is_winner,
+                'data_status':  data_status,
+            })
+
+            # Option leg (only if open_price is available)
+            if open_price is not None:
+                opt_cost     = open_price * SHARES
+                opt_proceeds = cc_close_price * SHARES if cc_close_price is not None else None
+                trades.append({
+                    **base,
+                    'leg':          'option',
+                    'variant_key':  variant_key,
+                    'expiry_label': expiry_label,
+                    'strike_label': strike_label,
+                    'strike':       strike,
+                    'expiry_date':  str(expiry_date) if expiry_date else None,
+                    'cc_open_price': open_price,
+                    'exit_time':    exit_time,
+                    'exit_price':   cc_close_price,
+                    'exit_reason':  exit_reason,
+                    'bars_held':    bars_held,
+                    'shares':       SHARES,
+                    'cost':         round(opt_cost, 2),
+                    'proceeds':     round(opt_proceeds, 2) if opt_proceeds is not None else None,
+                    'pnl_dollar':   option_pnl,
+                    'option_pnl':   option_pnl,
+                    'combined_pnl': combined_pnl,
+                    'is_winner':    is_winner,
+                    'data_status':  data_status,
+                })
+
+            # Position row (for metrics computation)
+            if combined_pnl is not None and is_winner is not None and exit_price is not None and bars_held is not None:
+                pos_row = {
+                    'trade_no':     trade_no,
+                    'variant_key':  variant_key,
+                    'expiry_label': expiry_label,
+                    'strike_label': strike_label,
+                    'entry_time':   entry_snapshot['entry_time'],
+                    'entry_price':  entry_price,
+                    'exit_price':   exit_price,
+                    'bars_held':    bars_held,
+                    'stock_pnl':    stock_pnl,
+                    'option_pnl':   option_pnl,
+                    'combined_pnl': combined_pnl,
+                    'is_winner':    is_winner,
+                    **{cat: indicators.get(cat, '') for cat in ['trend', 'momentum', 'volatility', 'volume']},
+                    'trade_date':   str(trade_date),
+                }
+                pos_list.append(pos_row)
+                positions.append(pos_row)   # for aggregate metrics
+
+        # Log this trade
+        if capture_evals:
+            # variant_results keyed by (expiry_label, offset) — pass dict
+            pass  # handled in calling code
 
     if not positions:
-        return _empty_metrics('no_signals'), []
+        return _empty_metrics('no_signals'), [], []
 
-    return _calc_metrics(positions), trades
+    return _calc_metrics(positions), trades, pos_list
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -940,23 +1081,21 @@ def run_combo(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_single(
-    df_signals:    pd.DataFrame,
-    indicators:    dict[str, str],
-    strike_offset: float,
-    window_start:  str,
-    window_end:    str,
-    seed:          int,
-    run_no:        int,
+    df_signals:   pd.DataFrame,
+    indicators:   dict[str, str],
+    window_start: str,
+    window_end:   str,
+    seed:         int,
+    run_no:       int,
     capture_evals: bool = False,
-) -> tuple[dict, list[dict]]:
+) -> tuple[dict, list[dict], list[dict]]:
     window_data, status = prepare_window(df_signals, window_start, window_end, seed)
     if window_data is None:
-        return _empty_summary(run_no, indicators, strike_offset,
-                              window_start, window_end, seed, status), []
+        return _empty_summary(run_no, indicators, window_start, window_end, seed, status), [], []
 
     df, sample_idx, day_dict, day_pos_map = window_data
-    metrics, trades = run_combo(
-        df, sample_idx, day_dict, day_pos_map, indicators, strike_offset,
+    metrics, trades, pos_list = run_combo(
+        df, sample_idx, day_dict, day_pos_map, indicators,
         capture_evals=capture_evals,
     )
 
@@ -966,25 +1105,23 @@ def run_single(
         'window_end':   window_end,
         'seed':         seed,
     }
-    full_trades = [{**context, **tr} for tr in trades]
+    full_trades   = [{**context, **tr} for tr in trades]
+    full_pos_list = [{**context, **p}  for p  in pos_list]
 
     summary = {
         **context,
-        'strike_offset': strike_offset,
         **{cat: indicators[cat] for cat in ['trend', 'momentum', 'volatility', 'volume']},
         **metrics,
     }
-    return summary, full_trades
+    return summary, full_trades, full_pos_list
 
 
-def _empty_summary(run_no, indicators, strike_offset,
-                   window_start, window_end, seed, status) -> dict:
+def _empty_summary(run_no, indicators, window_start, window_end, seed, status) -> dict:
     return {
         'run_no':        run_no,
         'window_start':  window_start,
         'window_end':    window_end,
         'seed':          seed,
-        'strike_offset': strike_offset,
         **{cat: indicators[cat] for cat in ['trend', 'momentum', 'volatility', 'volume']},
         **_empty_metrics(status),
     }
@@ -996,17 +1133,12 @@ def _empty_summary(run_no, indicators, strike_offset,
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Run one indicator combo × one strike offset across N windows.'
+        description='Run one indicator combo across N windows (all 12 CC variants).'
     )
     parser.add_argument('--trend',      default='adx',  help='Trend indicator')
     parser.add_argument('--momentum',   default='frc',  help='Momentum indicator')
     parser.add_argument('--volatility', default='atr',  help='Volatility indicator')
     parser.add_argument('--volume',     default='vrc',  help='Volume indicator')
-    parser.add_argument(
-        '--offset', type=float, default=3.0,
-        choices=[3.0, 2.0, -2.0, -3.0],
-        help='Strike offset from entry price (+3/+2=OTM, -2/-3=ITM). Default: 3.0',
-    )
     parser.add_argument('--seed', type=int, default=None,
                         help='Meta RNG seed (omit for a fresh random seed each run)')
     parser.add_argument(
@@ -1031,7 +1163,6 @@ def parse_args():
     seed = args.seed if args.seed is not None else secrets.randbelow(2**32)
     return (
         indicators,
-        args.offset,
         seed,
         datetime.date.fromisoformat(args.data_first),
         datetime.date.fromisoformat(args.data_last),
@@ -1046,9 +1177,9 @@ def combo_label(indicators: dict[str, str]) -> str:
 def generate_test_runs(n: int = N_RUNS, meta_seed: int = META_SEED) -> list[tuple[str, str, int]]:
     max_start  = DATA_LAST - datetime.timedelta(days=WINDOW_DAYS)
     total_days = (max_start - DATA_FIRST).days
-    rng     = np.random.default_rng(meta_seed)
-    offsets = rng.choice(total_days, size=n, replace=False)
-    seeds   = rng.integers(1, 10_000, size=n)
+    rng        = np.random.default_rng(meta_seed)
+    offsets    = rng.choice(total_days, size=n, replace=False)
+    seeds      = rng.integers(1, 10_000, size=n)
     return sorted(
         [
             (
@@ -1062,7 +1193,7 @@ def generate_test_runs(n: int = N_RUNS, meta_seed: int = META_SEED) -> list[tupl
     )
 
 
-def print_aggregate(runs_df: pd.DataFrame, label: str, offset: float):
+def print_aggregate(runs_df: pd.DataFrame, label: str):
     active   = runs_df[runs_df['n_trades'] > 0]
     n_runs   = len(runs_df)
     n_active = len(active)
@@ -1071,8 +1202,6 @@ def print_aggregate(runs_df: pd.DataFrame, label: str, offset: float):
         return
     pf_capped = active['profit_factor'].clip(upper=PF_CAP)
     print(f"\n  Combo         : {label}")
-    print(f"  Strike offset : {offset:+.0f}  "
-          f"({'OTM' if offset > 0 else 'ITM'} call)")
     print(f"  Runs          : {n_runs}  ({n_active} with trades)")
     print(f"  PnL hit rate  : {(active['pnl_positive'].sum() / n_active * 100):.0f}%  "
           f"({active['pnl_positive'].sum()}/{n_active} runs profitable)")
@@ -1091,8 +1220,8 @@ def print_aggregate(runs_df: pd.DataFrame, label: str, offset: float):
 
 def main():
     global DATA_FIRST, DATA_LAST, WINDOW_DAYS
-    indicators, strike_offset, meta_seed, DATA_FIRST, DATA_LAST, WINDOW_DAYS = parse_args()
-    label  = combo_label(indicators)
+    indicators, meta_seed, DATA_FIRST, DATA_LAST, WINDOW_DAYS = parse_args()
+    label = combo_label(indicators)
     active = {k: v for k, v in indicators.items() if v}
 
     if not active:
@@ -1103,22 +1232,20 @@ def main():
     m   = indicators['momentum']
     v   = indicators['volatility']
     vol = indicators['volume']
-    off_tag = f"{strike_offset:+.0f}".replace('+', 'p').replace('-', 'm')
 
     run_ts  = datetime.datetime.now().strftime('%m%d%H%M')
-    run_dir = REPORTS_DIR / f'cc_{label}_{off_tag}_{run_ts}'
+    run_dir = REPORTS_DIR / f'cc_{label}_{run_ts}'
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
     print(f"  Single Model — Covered Call Entry (3_covered_calls)")
     print(f"{'='*60}")
-    print(f"  Indicators    : {indicators}")
-    print(f"  Strike offset : {strike_offset:+.0f}  "
-          f"({'OTM' if strike_offset > 0 else 'ITM'} call)")
-    print(f"  Meta seed     : {meta_seed}")
-    print(f"  Runs          : {N_RUNS}  (window={WINDOW_DAYS} cal days each)")
-    print(f"  Data range    : {DATA_FIRST} -> {DATA_LAST}")
-    print(f"  Output dir    : {run_dir}")
+    print(f"  Indicators  : {indicators}")
+    print(f"  Variants    : {len(OPTION_VARIANTS)} (3 expiries × 6 strikes)")
+    print(f"  Meta seed   : {meta_seed}")
+    print(f"  Runs        : {N_RUNS}  (window={WINDOW_DAYS} cal days each)")
+    print(f"  Data range  : {DATA_FIRST} -> {DATA_LAST}")
+    print(f"  Output dir  : {run_dir}")
     print(f"{'='*60}\n")
 
     df_signals = load_or_build_signals()
@@ -1130,9 +1257,8 @@ def main():
     log_path = run_dir / 'run.log'
     with open(log_path, 'w', encoding='utf-8') as log_fh:
         log_fh.write(
-            f"combo: [{label}]  offset: [{strike_offset:+.0f}]  "
-            f"runs: {N_RUNS}  window_days: {WINDOW_DAYS}"
-            f"  model: [cc_entry]"
+            f"combo: [{label}]  variants: 12  runs: {N_RUNS}  window_days: {WINDOW_DAYS}"
+            f"  model: [cc_3_variants]"
             f"  generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         )
 
@@ -1144,8 +1270,8 @@ def main():
             )
 
             try:
-                summary, trades = run_single(
-                    df_signals, indicators, strike_offset,
+                summary, trades, pos_list = run_single(
+                    df_signals, indicators,
                     window_start, window_end, seed, run_no,
                     capture_evals=True,
                 )
@@ -1159,24 +1285,67 @@ def main():
                   f"[{summary['status']}]")
             all_summaries.append(summary)
 
-            stock_trades = [tr for tr in trades if tr.get('leg') == 'stock']
-            if stock_trades:
+            # Group trades by trade_no to log per-trade
+            trade_groups: dict[int, list] = {}
+            for tr in trades:
+                if tr.get('leg') == 'stock':
+                    tno = tr.get('trade_no', 0)
+                    if tno not in trade_groups:
+                        trade_groups[tno] = []
+                    trade_groups[tno].append(tr)
+
+            if trade_groups:
                 _log_model_start(log_fh, run_no, '-', t, m, v, vol)
-                for tr in stock_trades:
-                    _log_trade(log_fh, tr)
+                for tno in sorted(trade_groups.keys()):
+                    # Reconstruct variant_results for this trade_no
+                    vr = {}
+                    for tr in trades:
+                        if tr.get('trade_no') == tno and tr.get('leg') == 'stock':
+                            ek  = tr.get('expiry_label', '')
+                            sl  = tr.get('strike_label', '')
+                            key = (ek, sl)
+                            vr[key] = {
+                                'variant_key':     tr.get('variant_key', ''),
+                                'expiry_label':    ek,
+                                'strike_label':    sl,
+                                'strike':          tr.get('strike'),
+                                'expiry_date':     (
+                                    datetime.date.fromisoformat(tr['expiry_date'])
+                                    if tr.get('expiry_date') else None
+                                ),
+                                'open_price':      tr.get('cc_open_price'),
+                                'cc_close_price':  tr.get('exit_price'),
+                                'cc_close_reason': tr.get('exit_reason', ''),
+                                'cc_close_time':   tr.get('exit_time'),
+                                'stock_exit_price': tr.get('exit_price'),
+                                'stock_exit_time': tr.get('exit_time'),
+                                'stock_pnl':       tr.get('pnl_dollar'),
+                                'option_pnl':      tr.get('option_pnl'),
+                                'combined_pnl':    tr.get('combined_pnl'),
+                                'is_winner':       tr.get('is_winner'),
+                                'data_status':     tr.get('data_status', ''),
+                            }
+
+                    # Get first trade row for entry snapshot
+                    first_tr = trade_groups[tno][0]
+                    entry_snap = {
+                        'entry_time':    first_tr.get('entry_time', ''),
+                        'entry_price':   first_tr.get('entry_price', 0.0),
+                        'shares':        first_tr.get('shares', SHARES),
+                        'atr_at_entry':  first_tr.get('atr_at_entry'),
+                        'rsi_at_entry':  first_tr.get('rsi_at_entry'),
+                        'adx_at_entry':  first_tr.get('adx_at_entry'),
+                        'vwap_at_entry': first_tr.get('vwap_at_entry'),
+                    }
+                    _log_trade_table(log_fh, tno, indicators, entry_snap, vr, [])
                 _log_model_end(log_fh, run_no, '-', summary)
 
-            for tr in trades:
-                tr.pop('_cc_evals', None)
-                tr.pop('_opt_pnl',  None)
-                tr.pop('_cc_candidates', None)
-                tr.pop('_cc_candidate_close', None)
             all_trades.extend(trades)
 
     print(f"\n[output]  Log    -> {log_path}")
 
     runs_df   = pd.DataFrame(all_summaries)
-    runs_path = run_dir / f'cc_{label}_{off_tag}_runs.csv'
+    runs_path = run_dir / f'cc_{label}_runs.csv'
     runs_df.to_csv(runs_path, index=False)
     print(f"[output]  Runs   -> {runs_path}  ({len(runs_df)} rows)")
 
@@ -1184,25 +1353,25 @@ def main():
         col_order = [
             'run_no', 'trade_no', 'leg',
             'trend', 'momentum', 'volatility', 'volume',
-            'strike_offset', 'strike',
+            'variant_key', 'expiry_label', 'strike_label', 'strike', 'expiry_date',
             'trade_date', 'entry_time', 'exit_time', 'entry_price',
             'atr_at_entry', 'rsi_at_entry', 'adx_at_entry', 'vwap_at_entry',
-            'exit_price', 'exit_reason', 'bars_held',
-            'shares', 'cost', 'proceeds', 'pnl_dollar', 'pnl_pct', 'is_winner',
-            'cc_option_symbol', 'cc_strike', 'cc_expiry', 'cc_open_time', 'cc_open_price',
+            'cc_open_price', 'exit_price', 'exit_reason', 'bars_held',
+            'shares', 'cost', 'proceeds', 'pnl_dollar', 'option_pnl',
+            'combined_pnl', 'is_winner', 'data_status',
         ]
         trades_df   = pd.DataFrame(all_trades)
         cols        = [c for c in col_order if c in trades_df.columns]
-        trades_path = run_dir / f'cc_{label}_{off_tag}_trades.csv'
+        trades_path = run_dir / f'cc_{label}_trades.csv'
         trades_df[cols].to_csv(trades_path, index=False)
         print(f"[output]  Trades -> {trades_path}  ({len(trades_df):,} rows)")
     else:
         print("[output]  No trades to write.")
 
     print(f"\n{'='*60}")
-    print("  AGGREGATE RESULTS")
+    print("  AGGREGATE RESULTS (all variants combined)")
     print(f"{'='*60}")
-    print_aggregate(runs_df, label, strike_offset)
+    print_aggregate(runs_df, label)
     print(f"\n{'='*60}\n")
 
 
