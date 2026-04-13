@@ -153,7 +153,9 @@ def load_option_index() -> pd.DataFrame:
 # OPTION DATA  (per-contract file, cached by expiry+strike key)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_option_data_cache: dict[str, pd.DataFrame | None] = {}
+# Each cache entry is a dict of numpy arrays (not a DataFrame):
+#   { 'dates': datetime64[ns], 'avg_ask': float64, 'avg_bid': float64 }
+_option_data_cache: dict[str, dict | None] = {}
 
 
 def _option_file_path(expiry_int: int, strike: float) -> Path:
@@ -162,8 +164,9 @@ def _option_file_path(expiry_int: int, strike: float) -> Path:
     return OPTIONS_DIR / year_2 / fname
 
 
-def load_option_data(contract: dict) -> pd.DataFrame | None:
-    key  = f"{contract['expiration_date']}_{contract['strike_price']}"
+def load_option_data(contract: dict) -> dict | None:
+    """Load option CSV and cache numpy arrays for O(log n) binary-search lookups."""
+    key = f"{contract['expiration_date']}_{contract['strike_price']}"
     if key in _option_data_cache:
         return _option_data_cache[key]
     path = _option_file_path(contract['expiration_date'], contract['strike_price'])
@@ -172,39 +175,82 @@ def load_option_data(contract: dict) -> pd.DataFrame | None:
         return None
     df = pd.read_csv(path, parse_dates=['date'], low_memory=False)
     df = df.sort_values('date').reset_index(drop=True)
-    _option_data_cache[key] = df
-    return df
+    opt_data = {
+        'dates':   df['date'].values.astype('datetime64[ns]'),
+        'avg_ask': df['avg_ask'].values.astype(np.float64),
+        'avg_bid': df['avg_bid'].values.astype(np.float64),
+    }
+    _option_data_cache[key] = opt_data
+    return opt_data
 
 
 def get_option_price_at(
-    option_df:       pd.DataFrame | None,
-    ts:              pd.Timestamp,
+    opt_data:        dict | None,
+    ts,                               # pd.Timestamp, np.datetime64, or str
     col:             str,
     max_age_minutes: int | None = None,
 ) -> float | None:
     """Return the most recent value of `col` at or before `ts`.
-    If max_age_minutes is set, returns None if that quote is stale."""
-    if option_df is None or option_df.empty:
+    Binary search (O(log n)) on the sorted dates array.
+    If max_age_minutes is set, returns None if the quote is stale."""
+    if opt_data is None:
         return None
-    mask = option_df['date'] <= ts
-    if not mask.any():
+    dates = opt_data['dates']
+    if len(dates) == 0:
         return None
-    row = option_df.loc[mask].iloc[-1]
+    ts_ns = pd.Timestamp(ts).to_datetime64()   # normalise to datetime64[ns]
+    idx   = int(np.searchsorted(dates, ts_ns, side='right')) - 1
+    if idx < 0:
+        return None
     if max_age_minutes is not None:
-        age = (ts - pd.Timestamp(row['date'])).total_seconds() / 60
-        if age > max_age_minutes:
+        age_ns = float(ts_ns.astype(np.int64) - dates[idx].astype(np.int64))
+        if age_ns / 6e10 > max_age_minutes:    # 6e10 ns = 1 minute
             return None
-    val = float(row[col])
+    val = float(opt_data[col][idx])
     return val if val > 0 else None
 
 
-def _has_expiry_quote(option_df: pd.DataFrame | None, expiry_date: datetime.date) -> bool:
-    """True if option_df has at least one quote on expiry date at or after 3 PM."""
-    if option_df is None or option_df.empty:
+def _lookup_prices_vectorized(
+    opt_data:        dict | None,
+    bar_times:       np.ndarray,      # datetime64[ns] array
+    col:             str,
+    max_age_minutes: int | None = None,
+) -> np.ndarray:
+    """
+    Vectorized as-of price lookup for an array of bar timestamps.
+    One searchsorted call replaces N individual get_option_price_at calls.
+    Returns float64 array aligned to bar_times; NaN where no valid quote.
+    """
+    if opt_data is None or len(opt_data['dates']) == 0:
+        return np.full(len(bar_times), np.nan)
+
+    dates   = opt_data['dates']
+    values  = opt_data[col]
+
+    # For each bar, index of last option quote at-or-before that bar
+    indices = np.searchsorted(dates, bar_times, side='right') - 1
+    clamped = np.maximum(indices, 0)
+
+    raw   = values[clamped].astype(np.float64)
+    valid = indices >= 0                          # bar is after the first quote
+
+    if max_age_minutes is not None:
+        # age in nanoseconds → minutes;  6e10 ns = 1 min
+        age_ns = (bar_times.astype(np.int64) - dates[clamped].astype(np.int64)).astype(np.float64)
+        valid  = valid & (age_ns / 6e10 <= max_age_minutes)
+
+    valid &= raw > 0
+    return np.where(valid, raw, np.nan)
+
+
+def _has_expiry_quote(opt_data: dict | None, expiry_date: datetime.date) -> bool:
+    """True if opt_data has at least one quote on expiry date at or after 3 PM."""
+    if opt_data is None or len(opt_data['dates']) == 0:
         return False
-    threshold = pd.Timestamp(expiry_date) + pd.Timedelta(hours=EXPIRY_QUOTE_MIN_HOUR)
-    end       = pd.Timestamp(expiry_date) + pd.Timedelta(days=1)
-    return bool(((option_df['date'] >= threshold) & (option_df['date'] < end)).any())
+    threshold = (pd.Timestamp(expiry_date) + pd.Timedelta(hours=EXPIRY_QUOTE_MIN_HOUR)).to_datetime64()
+    end       = (pd.Timestamp(expiry_date) + pd.Timedelta(days=1)).to_datetime64()
+    dates     = opt_data['dates']
+    return bool(np.any((dates >= threshold) & (dates < end)))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -297,17 +343,17 @@ def find_cc_variant(
     if cands.empty:
         return None
 
-    contract  = cands.iloc[0].to_dict()
-    option_df = load_option_data(contract)
+    contract = cands.iloc[0].to_dict()
+    opt_data = load_option_data(contract)
 
-    open_price = get_option_price_at(option_df, entry_ts, 'avg_bid', MAX_QUOTE_AGE_MINUTES)
+    open_price = get_option_price_at(opt_data, entry_ts, 'avg_bid', MAX_QUOTE_AGE_MINUTES)
 
     return {
         'expiry_label':  expiry_label,
         'strike_label':  strike_label,
         'variant_key':   variant_key,
         'contract':      contract,
-        'option_df':     option_df,
+        'opt_data':      opt_data,
         'strike':        strike,
         'expiry_date':   friday,
         'expiry_int':    expiry_int,
@@ -360,25 +406,15 @@ def _build_cc_context(
     entry_global_idx: int,
 ) -> tuple[pd.DataFrame | None, int | None]:
     """
-    Build a DataFrame slice from the entry bar through the end of df.
-    Returns (df_slice, entry_iloc) with reset index, or (None, None) on failure.
+    Return (df, entry_global_idx) directly — no copy, no column conversion.
+
+    The forward walk in simulate_all_variants starts at entry_global_idx + 1,
+    so bars before the entry are never touched. df already spans only the
+    current window (set up by prepare_window) so no further filtering is needed.
     """
-    trade_date = df.loc[entry_global_idx, 'fnd_trade_date']
-    entry_dt   = pd.Timestamp(str(trade_date))
-
-    fnd_ts   = pd.to_datetime(df['fnd_trade_date'])
-    mask     = fnd_ts >= entry_dt
-    df_slice = df[mask].reset_index(drop=True)
-
-    if df_slice.empty:
+    if entry_global_idx >= len(df):
         return None, None
-
-    entry_ts = df.loc[entry_global_idx, 'date']
-    hit      = df_slice.index[df_slice['date'] == entry_ts]
-    if len(hit) == 0:
-        return None, None
-
-    return df_slice, int(hit[0])
+    return df, entry_global_idx
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -387,17 +423,16 @@ def _build_cc_context(
 
 def _build_result(
     variant:         dict,
-    bar:             pd.Series,
+    exit_time_str:   str,        # ISO timestamp string
+    bar_avg_bid:     float,      # stock market bid at exit bar
     cc_close_reason: str,
     cc_close_price:  float | None,
     bars_held:       int,
     entry_price:     float,
     shares:          int,
-    stock_override:  float | None = None,
 ) -> dict:
-    """Build a result dict for a closed variant."""
-    stock_exit_price = stock_override if stock_override is not None else float(bar['avg_bid'])
-    stock_pnl = shares * stock_exit_price - shares * entry_price - COMMISSION
+    """Build a result dict for a closed variant from pre-extracted scalar values."""
+    stock_pnl = shares * bar_avg_bid - shares * entry_price - COMMISSION
 
     if variant['open_price'] is not None and cc_close_price is not None:
         opt_pnl      = (variant['open_price'] - cc_close_price) * shares - COMMISSION
@@ -410,9 +445,6 @@ def _build_result(
         is_winner    = None
         data_status  = 'no_open_price' if variant['open_price'] is None else 'no_close_price'
 
-    cc_close_time  = str(bar['date'])
-    stock_exit_time = str(bar['date'])
-
     return {
         'variant_key':        variant['variant_key'],
         'expiry_label':       variant['expiry_label'],
@@ -422,10 +454,10 @@ def _build_result(
         'open_price':         variant['open_price'],
         'cc_close_price':     cc_close_price,
         'cc_close_reason':    cc_close_reason,
-        'cc_close_time':      cc_close_time,
-        'stock_exit_price':   round(stock_exit_price, 4),
+        'cc_close_time':      exit_time_str,
+        'stock_exit_price':   round(bar_avg_bid, 4),
         'stock_exit_reason':  cc_close_reason,
-        'stock_exit_time':    stock_exit_time,
+        'stock_exit_time':    exit_time_str,
         'bars_held':          bars_held,
         'shares':             shares,
         'stock_pnl':          round(stock_pnl, 2),
@@ -472,102 +504,114 @@ def simulate_all_variants(
     all_variants:  dict,
     entry_price:   float,
     shares:        int,
-    capture_evals: bool = False,
+    capture_evals: bool = False,   # retained for API compat; evals not computed
 ) -> tuple[dict, list]:
     """
-    Walk forward through df_slice once, handling all 12 variants simultaneously.
+    Determine exit for all 18 variants using vectorized numpy operations.
 
-    Returns (variant_results, evals):
-      variant_results: dict keyed by (expiry_label, offset) -> result dict
-      evals: list of per-bar eval dicts (only if capture_evals=True)
+    For each open variant:
+      1. Pre-extract numpy arrays from df_slice once (avoids per-bar iloc).
+      2. One _lookup_prices_vectorized call gives the option-ask array for all
+         future bars in a single searchsorted pass.
+      3. np.argmax on boolean masks finds the first buyback / expiry bar —
+         no Python bar-by-bar loop needed.
+
+    Returns (variant_results, [])  — evals list is always empty (was never used).
     """
     open_variants  = {k: v for k, v in all_variants.items() if v is not None}
     closed_results = {}
-    evals          = []
 
-    for i in range(entry_iloc + 1, len(df_slice)):
-        bar      = df_slice.iloc[i]
-        bar_time = pd.Timestamp(bar['date'])
-        bar_date = bar_time.date()
-        bar_number = i - entry_iloc   # bars_held counter
+    n_future = len(df_slice) - entry_iloc - 1
 
-        if capture_evals and open_variants:
-            eval_row = {
-                'time':      str(bar['date']).split(' ')[-1] if ' ' in str(bar['date']) else str(bar['date']),
-                'stock_wap': round(float(bar['average']), 2),
-                'asks':      {},
-            }
-            for key, variant in open_variants.items():
-                opt_ask = get_option_price_at(
-                    variant['option_df'], bar_time, 'avg_ask', MAX_QUOTE_AGE_MINUTES
-                )
-                eval_row['asks'][variant['variant_key']] = (
-                    round(float(opt_ask), 2) if opt_ask is not None else None
-                )
-            evals.append(eval_row)
-
-        for key in list(open_variants.keys()):
-            variant = open_variants[key]
-
-            opt_ask = get_option_price_at(
-                variant['option_df'], bar_time, 'avg_ask', MAX_QUOTE_AGE_MINUTES
-            )
-
-            # Buyback check
-            if opt_ask is not None and opt_ask < OPTION_EXIT_PRICE:
+    if n_future <= 0:
+        # No bars after entry — immediate window end for all open variants
+        last         = df_slice.iloc[-1]
+        last_time_np = last['date']
+        last_str     = str(pd.Timestamp(last_time_np))
+        last_bid     = float(last['avg_bid'])
+        for key, variant in open_variants.items():
+            late_ask = get_option_price_at(variant['opt_data'], last_time_np, 'avg_ask')
+            if late_ask is not None and late_ask < OPTION_EXIT_PRICE:
                 closed_results[key] = _build_result(
-                    variant, bar, 'buyback', opt_ask, bar_number, entry_price, shares
+                    variant, last_str, last_bid,
+                    'buyback_late_data', late_ask, 0, entry_price, shares
                 )
-                del open_variants[key]
-                continue
+            else:
+                close_bid = get_option_price_at(variant['opt_data'], last_time_np, 'avg_bid')
+                closed_results[key] = _build_result(
+                    variant, last_str, last_bid,
+                    'window_end', close_bid, 0, entry_price, shares
+                )
+    else:
+        # Pre-extract numpy arrays — one allocation, no per-bar pandas overhead
+        future        = df_slice.iloc[entry_iloc + 1:]
+        bar_times_np  = future['date'].values.astype('datetime64[ns]')
+        bar_avg_bids  = future['avg_bid'].values.astype(np.float64)
 
-            # Expiry check: at or after EXPIRY_QUOTE_MIN_HOUR on expiry_date
-            expiry_threshold = pd.Timestamp(variant['expiry_date']) + pd.Timedelta(hours=EXPIRY_QUOTE_MIN_HOUR)
-            if bar_time >= expiry_threshold:
-                stock_bid = float(bar['avg_bid'])
-                if stock_bid > variant['strike']:
-                    closed_results[key] = _build_result(
-                        variant, bar, 'assigned', 0.0, bar_number, entry_price, shares,
-                        stock_override=variant['strike']
-                    )
+        for key, variant in open_variants.items():
+            opt_data = variant['opt_data']
+
+            # Vectorized ask lookup — one searchsorted pass for all future bars
+            opt_asks = _lookup_prices_vectorized(
+                opt_data, bar_times_np, 'avg_ask', MAX_QUOTE_AGE_MINUTES
+            )
+
+            # Buyback: first bar with a valid (non-NaN) ask below threshold
+            buyback_mask = ~np.isnan(opt_asks) & (opt_asks < OPTION_EXIT_PRICE)
+            buyback_idx  = int(np.argmax(buyback_mask)) if buyback_mask.any() else n_future
+
+            # Expiry: first bar at or after 3 PM on expiry Friday
+            expiry_dt64 = (
+                pd.Timestamp(variant['expiry_date']) + pd.Timedelta(hours=EXPIRY_QUOTE_MIN_HOUR)
+            ).to_datetime64()
+            expiry_mask = bar_times_np >= expiry_dt64
+            expiry_idx  = int(np.argmax(expiry_mask)) if expiry_mask.any() else n_future
+
+            exit_idx = min(buyback_idx, expiry_idx)
+
+            if exit_idx >= n_future:
+                # Window end (neither buyback nor expiry fired before data ran out)
+                exit_str  = str(pd.Timestamp(bar_times_np[-1]))
+                exit_bid  = float(bar_avg_bids[-1])
+                bars_held = n_future
+                late_ask  = get_option_price_at(opt_data, bar_times_np[-1], 'avg_ask')
+                if late_ask is not None and late_ask < OPTION_EXIT_PRICE:
+                    cc_reason = 'buyback_late_data'
+                    cc_price  = late_ask
                 else:
-                    closed_results[key] = _build_result(
-                        variant, bar, 'expired_otm', 0.0, bar_number, entry_price, shares
-                    )
-                del open_variants[key]
-                continue
+                    cc_price  = get_option_price_at(opt_data, bar_times_np[-1], 'avg_bid')
+                    cc_reason = 'window_end'
+            else:
+                exit_str  = str(pd.Timestamp(bar_times_np[exit_idx]))
+                exit_bid  = float(bar_avg_bids[exit_idx])
+                bars_held = exit_idx + 1
 
-        if not open_variants:
-            break
+                if exit_idx == buyback_idx:
+                    # Buyback wins; also handles the tie case (same bar)
+                    cc_reason = 'buyback'
+                    cc_price  = float(opt_asks[buyback_idx])
+                else:
+                    # Expiry
+                    if exit_bid > variant['strike']:
+                        cc_reason = 'assigned'
+                        cc_price  = 0.0
+                        exit_bid  = float(variant['strike'])   # sold at strike
+                    else:
+                        cc_reason = 'expired_otm'
+                        cc_price  = 0.0
 
-    # Window end: close remaining open variants
-    last      = df_slice.iloc[-1]
-    last_time = pd.Timestamp(last['date'])
-    last_bar_number = len(df_slice) - 1 - entry_iloc
-
-    for key, variant in open_variants.items():
-        # Try late buyback data
-        late_ask = get_option_price_at(variant['option_df'], last_time, 'avg_ask')
-        if late_ask is not None and late_ask < OPTION_EXIT_PRICE:
             closed_results[key] = _build_result(
-                variant, last, 'buyback_late_data', late_ask,
-                last_bar_number, entry_price, shares
-            )
-        else:
-            # Use closing bid if available, else None
-            close_bid = get_option_price_at(variant['option_df'], last_time, 'avg_bid')
-            closed_results[key] = _build_result(
-                variant, last, 'window_end', close_bid,
-                last_bar_number, entry_price, shares
+                variant, exit_str, exit_bid,
+                cc_reason, cc_price, bars_held, entry_price, shares
             )
 
-    # Add not-found variants
+    # Not-found variants (contract missing from option index)
     for key in OPTION_VARIANTS:
         if key not in closed_results:
             expiry_label, strike_label = key
             closed_results[key] = _not_found_result(expiry_label, strike_label)
 
-    return closed_results, evals
+    return closed_results, []   # evals always empty
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1065,10 +1109,6 @@ def run_combo(
                 pos_list.append(pos_row)
                 positions.append(pos_row)   # for aggregate metrics
 
-        # Log this trade
-        if capture_evals:
-            # variant_results keyed by (expiry_label, offset) — pass dict
-            pass  # handled in calling code
 
     if not positions:
         return _empty_metrics('no_signals'), [], []

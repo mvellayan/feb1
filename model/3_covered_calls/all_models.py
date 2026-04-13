@@ -212,7 +212,7 @@ def run_all_models(
         try:
             metrics, raw_trades, pos_list = S.run_combo(
                 df, sample_idx, day_dict, day_pos_map, indicators,
-                capture_evals=(log_fh is not None),
+                capture_evals=False,
             )
         except Exception as exc:
             err_msg = (f"[{seq_no}|M{model_id}] "
