@@ -676,9 +676,9 @@ def summarize_run(run_dir: Path):
 
     df, n_batches = load_all_summaries(run_dir=run_dir)
 
-    # Rename columns if needed (summary CSV uses 'number_of_trades' etc.)
+    # Rename columns back to internal names used by aggregate() in utils.py.
+    # Summary CSVs on disk use display names; we reverse them for analysis.
     rename_map = {
-        'number_of_trades': 'n_trades',
         'avg_entry_price':  'avg_entry',
         'avg_exit_price':   'avg_exit',
         'avg_bars_held':    'avg_duration_bars',
