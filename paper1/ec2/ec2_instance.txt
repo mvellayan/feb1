@@ -1,0 +1,10 @@
+REGION=us-east-1
+INSTANCE_ID=i-04919dcd2691f05ee
+PUBLIC_DNS=ec2-13-218-34-79.compute-1.amazonaws.com
+PUBLIC_IP=13.218.34.79
+PRIVATE_IP=172.31.18.159
+AVAILABILITY_ZONE=us-east-1a
+SSH_USER=ec2-user
+KEY_NAME=Muthu-06Apr25
+KEY_PATH=/Users/muthu/.ssh/Muthu-06Apr25.pem
+IBG_SERVICE=ibgateway.service
