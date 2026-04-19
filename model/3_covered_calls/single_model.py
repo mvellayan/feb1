@@ -1193,7 +1193,37 @@ def parse_args():
         '--window-days', type=int, default=14,
         help='Calendar days per test window (default: 14)',
     )
+    parser.add_argument(
+        '--buyback', type=float, default=0.50,
+        help='Option ask threshold to trigger a buyback exit (default: 0.50)',
+    )
+    parser.add_argument(
+        '--expiry-label', nargs='+', default=None,
+        metavar='LABEL',
+        help='Expiry weeks to include: w0 w1 w2 (default: all three)',
+    )
+    parser.add_argument(
+        '--strike-label', nargs='+', default=None,
+        metavar='LABEL',
+        help='Strike labels to include: s-2 s-1 s-0 s+0 s+1 s+2 (default: all six)',
+    )
     args = parser.parse_args()
+
+    global OPTION_EXIT_PRICE, OPTION_VARIANTS
+    OPTION_EXIT_PRICE = args.buyback
+
+    expiry_filter = args.expiry_label or EXPIRY_WEEKS
+    strike_filter = args.strike_label or STRIKE_LABELS
+
+    invalid_expiry = [e for e in expiry_filter if e not in EXPIRY_WEEKS]
+    invalid_strike = [s for s in strike_filter if s not in STRIKE_LABELS]
+    if invalid_expiry:
+        parser.error(f"Invalid --expiry-label value(s): {invalid_expiry}. Choose from {EXPIRY_WEEKS}")
+    if invalid_strike:
+        parser.error(f"Invalid --strike-label value(s): {invalid_strike}. Choose from {STRIKE_LABELS}")
+
+    OPTION_VARIANTS = [(ew, sl) for ew in expiry_filter for sl in strike_filter]
+
     indicators = {
         'trend':      args.trend.strip().lower(),
         'momentum':   args.momentum.strip().lower(),
@@ -1231,6 +1261,152 @@ def generate_test_runs(n: int = N_RUNS, meta_seed: int = META_SEED) -> list[tupl
         ],
         key=lambda t: t[0],
     )
+
+
+def write_single_report(
+    runs_df:    pd.DataFrame,
+    label:      str,
+    indicators: dict,
+    run_dir:    'Path',
+    argv:       list,
+) -> None:
+    """Write run_analysis.md with full parameters and aggregate summary."""
+    import json as _json
+
+    now  = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    path = run_dir / 'run_analysis.md'
+
+    expiry_active = sorted({ew for ew, _ in OPTION_VARIANTS})
+    strike_active = sorted({sl for _, sl in OPTION_VARIANTS})
+    active = runs_df[runs_df['n_trades'] > 0]
+    n_runs   = len(runs_df)
+    n_active = len(active)
+
+    lines = [f'# Single Model Run — {label}']
+    lines.append(f'\n_Generated: {now}_\n')
+
+    # ── Parameters ────────────────────────────────────────────────────────────
+    lines.append('## Run Parameters\n')
+    lines.append('| Parameter | Value |')
+    lines.append('|---|---|')
+    lines.append(f'| Command            | `{" ".join(argv)}` |')
+    lines.append(f'| Combo              | `{label}` |')
+    lines.append(f'| Trend              | {indicators.get("trend", "—")} |')
+    lines.append(f'| Momentum           | {indicators.get("momentum", "—")} |')
+    lines.append(f'| Volatility         | {indicators.get("volatility", "—")} |')
+    lines.append(f'| Volume             | {indicators.get("volume", "—")} |')
+    lines.append(f'| Expiry labels      | {", ".join(expiry_active)} |')
+    lines.append(f'| Strike labels      | {", ".join(strike_active)} |')
+    lines.append(f'| Variants tested    | {len(OPTION_VARIANTS)} |')
+    lines.append(f'| Date range         | {DATA_FIRST} → {DATA_LAST} |')
+    lines.append(f'| Runs               | {N_RUNS} |')
+    lines.append(f'| Window length      | {WINDOW_DAYS} calendar days |')
+    lines.append(f'| Sample bars/window | {N_SAMPLE:,} |')
+    lines.append(f'| Shares per trade   | {SHARES} |')
+    lines.append(f'| Commission         | ${COMMISSION:.2f} per round-trip |')
+    lines.append(f'| Buyback threshold  | ${OPTION_EXIT_PRICE:.2f} |')
+    lines.append(f'| Output directory   | `{run_dir.name}` |')
+    lines.append('')
+
+    # ── Aggregate summary ─────────────────────────────────────────────────────
+    lines.append('## Aggregate Results\n')
+    if n_active == 0:
+        lines.append('_No trades fired across any run._\n')
+    else:
+        pf_capped   = active['profit_factor'].clip(upper=PF_CAP)
+        pnl_hit     = active['pnl_positive'].sum()
+        lines.append('| Metric | Value |')
+        lines.append('|---|---|')
+        lines.append(f'| Runs with trades   | {n_active} / {n_runs} |')
+        lines.append(f'| PnL hit rate       | {pnl_hit / n_active * 100:.0f}%  ({pnl_hit}/{n_active} runs profitable) |')
+        lines.append(f'| Avg total PnL      | ${active["total_pnl"].mean():,.2f}  (std ${active["total_pnl"].std():,.2f}) |')
+        lines.append(f'| Total PnL (sum)    | ${active["total_pnl"].sum():,.2f} |')
+        lines.append(f'| Avg win rate       | {active["win_rate"].mean():.1f}% |')
+        lines.append(f'| Avg Sharpe         | {active["sharpe"].mean():.3f} |')
+        lines.append(f'| Avg profit factor  | {pf_capped.mean():.3f} |')
+        lines.append(f'| Avg max drawdown   | ${active["max_drawdown"].mean():,.2f} |')
+        lines.append(f'| Avg trades / run   | {active["n_trades"].mean():.1f} |')
+        lines.append(f'| Total trades       | {int(active["n_trades"].sum())} |')
+        lines.append('')
+
+        # Per-run table
+        lines.append('## Per-Run Results\n')
+        display = active[['n_trades', 'win_rate', 'total_pnl', 'avg_pnl',
+                           'sharpe', 'profit_factor', 'max_drawdown',
+                           'status']].copy()
+        display.index.name = 'run'
+        display = display.reset_index()
+        display['run'] = display['run'] + 1
+        display.columns = ['run', 'trades', 'win_rate', 'total_pnl', 'avg_pnl',
+                            'sharpe', 'profit_factor', 'max_drawdown', 'status']
+        display['total_pnl']      = display['total_pnl'].round(2)
+        display['avg_pnl']        = display['avg_pnl'].round(2)
+        display['sharpe']         = display['sharpe'].round(3)
+        display['profit_factor']  = display['profit_factor'].round(3)
+        display['max_drawdown']   = display['max_drawdown'].round(2)
+        lines.append(md_table(display, n=len(display)))
+        lines.append('')
+
+    path.write_text('\n'.join(lines), encoding='utf-8')
+    print(f"[output]  Report -> {path}")
+
+
+_TRADING_MINS_PER_DAY = 6.5 * 60   # 390 minutes per trading day
+
+
+def restructure_trades(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge stock and option legs into one row per covered-call position.
+
+    - Pulls cc_close_price from the option leg's exit_price.
+    - Renames entry_price → entry_stock_price, exit_price → stock_exit_price,
+      pnl_dollar → stock_pnl.
+    - Adds days_held = bars_held / 390.
+    - Drops: leg, variant_key, trade_date, atr/rsi/adx/vwap_at_entry,
+             cost, proceeds, is_winner, data_status.
+    """
+    if df.empty:
+        return df
+
+    # Detect which ID columns are present (differs between all_models / single_model)
+    id_cols = [c for c in ['batch_no', 'model_id', 'run_no', 'trade_no',
+                            'expiry_label', 'strike_label']
+               if c in df.columns]
+
+    stock = df[df['leg'] == 'stock'].copy()
+    opt   = df[df['leg'] == 'option'][id_cols + ['exit_price']].copy()
+    opt   = opt.rename(columns={'exit_price': 'cc_close_price'})
+
+    merged = stock.merge(opt, on=id_cols, how='left')
+
+    merged = merged.rename(columns={
+        'entry_price': 'entry_stock_price',
+        'exit_price':  'stock_exit_price',
+        'pnl_dollar':  'stock_pnl',
+    })
+
+    merged['days_held'] = (merged['bars_held'] / _TRADING_MINS_PER_DAY).round(2)
+
+    # cc_open_days: calendar days from entry to expiry at 16:00
+    if 'entry_time' in merged.columns and 'expiry_date' in merged.columns:
+        entry_dt  = pd.to_datetime(merged['entry_time'])
+        expiry_dt = pd.to_datetime(merged['expiry_date']) + pd.Timedelta(hours=16)
+        merged['cc_open_days'] = (
+            (expiry_dt - entry_dt).dt.total_seconds() / 86400
+        ).round(2)
+
+    col_order = [
+        'batch_no', 'model_id', 'run_no', 'trade_no',
+        'trend', 'momentum', 'volatility', 'volume',
+        'expiry_label', 'strike_label', 'strike', 'expiry_date',
+        'entry_time', 'exit_time',
+        'entry_stock_price', 'stock_exit_price',
+        'cc_open_price', 'cc_open_days', 'cc_close_price',
+        'exit_reason', 'bars_held', 'days_held', 'shares',
+        'stock_pnl', 'option_pnl', 'combined_pnl',
+    ]
+    cols = [c for c in col_order if c in merged.columns]
+    return merged[cols].reset_index(drop=True)
 
 
 def print_aggregate(runs_df: pd.DataFrame, label: str):
@@ -1281,7 +1457,10 @@ def main():
     print(f"  Single Model — Covered Call Entry (3_covered_calls)")
     print(f"{'='*60}")
     print(f"  Indicators  : {indicators}")
-    print(f"  Variants    : {len(OPTION_VARIANTS)} (3 expiries × 6 strikes)")
+    expiry_active = sorted({ew for ew, _ in OPTION_VARIANTS})
+    strike_active = sorted({sl for _, sl in OPTION_VARIANTS})
+    print(f"  Variants    : {len(OPTION_VARIANTS)}  "
+          f"expiry={expiry_active}  strike={strike_active}")
     print(f"  Meta seed   : {meta_seed}")
     print(f"  Runs        : {N_RUNS}  (window={WINDOW_DAYS} cal days each)")
     print(f"  Data range  : {DATA_FIRST} -> {DATA_LAST}")
@@ -1390,20 +1569,9 @@ def main():
     print(f"[output]  Runs   -> {runs_path}  ({len(runs_df)} rows)")
 
     if all_trades:
-        col_order = [
-            'run_no', 'trade_no', 'leg',
-            'trend', 'momentum', 'volatility', 'volume',
-            'variant_key', 'expiry_label', 'strike_label', 'strike', 'expiry_date',
-            'trade_date', 'entry_time', 'exit_time', 'entry_price',
-            'atr_at_entry', 'rsi_at_entry', 'adx_at_entry', 'vwap_at_entry',
-            'cc_open_price', 'exit_price', 'exit_reason', 'bars_held',
-            'shares', 'cost', 'proceeds', 'pnl_dollar', 'option_pnl',
-            'combined_pnl', 'is_winner', 'data_status',
-        ]
-        trades_df   = pd.DataFrame(all_trades)
-        cols        = [c for c in col_order if c in trades_df.columns]
+        trades_df   = restructure_trades(pd.DataFrame(all_trades))
         trades_path = run_dir / f'cc_{label}_trades.csv'
-        trades_df[cols].to_csv(trades_path, index=False)
+        trades_df.to_csv(trades_path, index=False)
         print(f"[output]  Trades -> {trades_path}  ({len(trades_df):,} rows)")
     else:
         print("[output]  No trades to write.")
@@ -1413,6 +1581,8 @@ def main():
     print(f"{'='*60}")
     print_aggregate(runs_df, label)
     print(f"\n{'='*60}\n")
+
+    write_single_report(runs_df, label, indicators, run_dir, sys.argv)
 
 
 if __name__ == '__main__':

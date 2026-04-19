@@ -162,19 +162,9 @@ def write_summary_csv(summary_df: pd.DataFrame, seq_no: int, run_dir: Path) -> P
 def write_trades_csv(trades_df: pd.DataFrame, seq_no: int, run_dir: Path) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / f'{seq_no}_trades.csv'
-    col_order = [
-        'batch_no', 'model_id', 'trade_no', 'leg',
-        'trend', 'momentum', 'volatility', 'volume',
-        'variant_key', 'expiry_label', 'strike_label', 'strike', 'expiry_date',
-        'trade_date', 'entry_time', 'exit_time', 'entry_price',
-        'atr_at_entry', 'rsi_at_entry', 'adx_at_entry', 'vwap_at_entry',
-        'cc_open_price', 'exit_price', 'exit_reason', 'bars_held',
-        'shares', 'cost', 'proceeds', 'pnl_dollar', 'option_pnl',
-        'combined_pnl', 'is_winner', 'data_status',
-    ]
-    cols = [c for c in col_order if c in trades_df.columns]
-    trades_df[cols].to_csv(path, index=False)
-    print(f"[{seq_no}][report]  Trades   -> {path}  ({len(trades_df):,} records)")
+    out  = S.restructure_trades(trades_df)
+    out.to_csv(path, index=False)
+    print(f"[{seq_no}][report]  Trades   -> {path}  ({len(out):,} records)")
     return path
 
 
@@ -391,7 +381,9 @@ def run_model_set(
 # ── top-level worker wrapper (module-level for multiprocessing pickling) ───────
 
 def _run_window(args: tuple) -> int:
-    seq_no, run_dir, date_start, date_end, seed = args
+    seq_no, run_dir, date_start, date_end, seed, buyback, expiry_filter, strike_filter = args
+    S.OPTION_EXIT_PRICE = buyback
+    S.OPTION_VARIANTS   = [(ew, sl) for ew in expiry_filter for sl in strike_filter]
     run_model_set(seq_no, run_dir, date_start, date_end, seed)
     return seq_no
 
@@ -406,7 +398,7 @@ def analyse_option_variants(df: pd.DataFrame, n_batches: int) -> pd.DataFrame:
     across all 1,221 combos and all batches.
     Returns one row per variant (18 rows), ranked by consistency_score.
     """
-    active = df[df['n_trades'] > 0]
+    active = df[df['number_of_trades'] > 0]
     rows   = []
     for (expiry_label, strike_label), grp in active.groupby(['expiry_label', 'strike_label']):
         variant_key  = f"{expiry_label}/{strike_label}"
@@ -436,7 +428,7 @@ def analyse_option_variants(df: pd.DataFrame, n_batches: int) -> pd.DataFrame:
             'expiry_label':      expiry_label,
             'strike_label':      strike_label,
             'batch_count':       int(grp['batch_no'].nunique()) if 'batch_no' in grp.columns else n_batches,
-            'avg_trades':        round(grp['n_trades'].mean(), 1),
+            'avg_trades':        round(grp['number_of_trades'].mean(), 1),
             'avg_win_rate':      round(grp['win_rate'].mean(), 1),
             'avg_total_pnl':     round(grp['total_pnl'].mean(), 2),
             'pnl_hit_rate':      round(pnl_hit, 3),
@@ -462,23 +454,44 @@ def write_markdown_report(
     n_batches:    int,
     total_rows:   int,
     run_dir:      Path,
+    run_params:   dict | None = None,
 ):
+    p    = run_params or {}
     now  = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     path = run_dir / 'batch_run_analysis.md'
 
-    lines = ['# Batch Run Analysis — Covered Call Variants (3 expiries × 4 strikes)']
+    n_variants     = p.get('n_variants',     len(S.OPTION_VARIANTS))
+    expiry_labels  = p.get('expiry_labels',  S.EXPIRY_WEEKS)
+    strike_labels  = p.get('strike_labels',  S.STRIKE_LABELS)
+    n_combos       = len(models_df) if len(models_df) > 0 else 1_221
+    rows_per_win   = n_combos * n_variants
+
+    lines = ['# Batch Run Analysis — Covered Call Variants']
     lines.append(f'\n_Generated: {now}_\n')
-    lines.append('## Overview\n')
-    lines.append('| Metric | Value |')
+    lines.append('## Run Parameters\n')
+    lines.append('| Parameter | Value |')
     lines.append('|---|---|')
-    lines.append(f'| Run directory             | {run_dir.name} |')
-    lines.append(f'| Runs analysed             | {n_batches} |')
-    lines.append(f'| Total scenario-runs       | {total_rows:,} |')
-    lines.append(f'| Unique combos (4-tuple)   | {len(models_df):,} |')
-    lines.append(f'| Option variants tested    | 18 (w0/w1/w2 × s-2/s-1/s-0/s+0/s+1/s+2) |')
-    lines.append(f'| Summary rows per window   | 21,978 (1,221 × 18) |')
-    lines.append(f'| Min runs threshold        | {MIN_BATCHES} |')
-    lines.append(f'| Profit factor cap         | {PF_CAP} |')
+    lines.append(f'| Run directory      | `{run_dir.name}` |')
+    lines.append(f'| Date range         | {p.get("date_first", "—")} → {p.get("date_last", "—")} |')
+    lines.append(f'| Windows run        | {p.get("n_windows", n_batches)} |')
+    lines.append(f'| Windows analysed   | {n_batches} |')
+    lines.append(f'| Window length      | {p.get("window_days", "—")} calendar days |')
+    lines.append(f'| Random seed        | {p.get("random_seed", "—")} |')
+    lines.append(f'| Workers            | {p.get("n_workers", "—")} |')
+    lines.append(f'| Sample bars/window | {p.get("n_sample", S.N_SAMPLE):,} |')
+    lines.append(f'| Shares per trade   | {p.get("shares", S.SHARES)} |')
+    lines.append(f'| Commission         | ${p.get("commission", S.COMMISSION):.2f} per round-trip |')
+    lines.append(f'| Buyback threshold  | ${p.get("buyback", S.OPTION_EXIT_PRICE):.2f} |')
+    lines.append(f'| Expiry labels      | {", ".join(expiry_labels)} |')
+    lines.append(f'| Strike labels      | {", ".join(strike_labels)} |')
+    lines.append(f'| Variants tested    | {n_variants} ({" × ".join([str(len(expiry_labels)), str(len(strike_labels))])}) |')
+    lines.append(f'| Total scenario-rows| {total_rows:,} |')
+    lines.append(f'| Unique combos      | {n_combos:,} |')
+    lines.append(f'| Rows per window    | {rows_per_win:,} ({n_combos:,} combos × {n_variants} variants) |')
+    lines.append(f'| Min runs threshold | {MIN_BATCHES} |')
+    lines.append(f'| Profit factor cap  | {PF_CAP} |')
+    if p.get('argv'):
+        lines.append(f'| Command            | `{" ".join(p["argv"])}` |')
     lines.append('')
     lines.append('### Consistency Score Formula\n')
     lines.append('```')
@@ -514,14 +527,10 @@ def write_markdown_report(
     lines.append(md_table(models_df[[c for c in display_model_cols if c in models_df.columns]]))
     lines.append('')
 
-    bottom = models_df[[c for c in display_model_cols if c in models_df.columns]].tail(TOP_N).iloc[::-1].copy()
-    bottom['rank'] = range(1, len(bottom) + 1)
-    lines.append(f'## Bottom {TOP_N} Indicator Combos\n')
-    lines.append(md_table(bottom))
-    lines.append('')
-
-    # ── Category rankings ──────────────────────────────────────────────────────
+    # ── Category rankings (skip momentum) ────────────────────────────────────
     for cat, cdf in category_dfs.items():
+        if cat == 'momentum':
+            continue
         display_cols = [
             'rank', cat, 'batch_count', 'avg_trades', 'avg_win_rate',
             'avg_total_pnl', 'pnl_hit_rate', 'avg_sharpe', 'consistency_score',
@@ -581,7 +590,7 @@ def append_to_all_runs(df: pd.DataFrame, run_dir: Path) -> None:
     all_runs_path = REPORTS_DIR / 'all_runs.csv'
     run_ts = run_dir.name
 
-    active = df[df['n_trades'] > 0].copy()
+    active = df[df['number_of_trades'] > 0].copy()
     if active.empty:
         print("[all_runs]  No active rows — skipping.")
         return
@@ -603,15 +612,15 @@ def append_to_all_runs(df: pd.DataFrame, run_dir: Path) -> None:
         vol = key_dict['volume']
         vkey = key_dict['variant_key']
 
-        n_total = int(grp['n_trades'].sum())
+        n_total = int(grp['number_of_trades'].sum())
         if n_total == 0:
             continue
 
         def _wavg(col: str, fallback: float = 0.0) -> float:
-            """Weighted average of col by n_trades; falls back to unweighted mean if col missing."""
+            """Weighted average of col by number_of_trades; falls back to unweighted mean if col missing."""
             if col not in grp.columns:
                 return fallback
-            return round(float((grp[col] * grp['n_trades']).sum() / n_total), 2)
+            return round(float((grp[col] * grp['number_of_trades']).sum() / n_total), 2)
 
         pf_capped  = grp['profit_factor'].clip(upper=PF_CAP) if 'profit_factor' in grp.columns else pd.Series([0.0])
         pnl_hit    = float((grp['total_pnl'] > 0).mean()) if 'total_pnl' in grp.columns else 0.0
@@ -669,12 +678,67 @@ def append_to_all_runs(df: pd.DataFrame, run_dir: Path) -> None:
 # ANALYSIS — SUMMARIZE RUN
 # ══════════════════════════════════════════════════════════════════════════════
 
+def consolidate_csvs(run_dir: Path) -> None:
+    """
+    Merge all per-window {n}_summary.csv and {n}_trades.csv into single
+    summary.csv and trades.csv, then delete the individual files.
+    Run logs ({n}_run.log) are left as-is.
+    """
+    for stem, pattern in [('summary', '*_summary.csv'), ('trades', '*_trades.csv')]:
+        files = sorted(
+            run_dir.glob(pattern),
+            key=lambda p: int(p.stem.split('_')[0]),
+        )
+        if not files:
+            continue
+        out_path = run_dir / f'{stem}.csv'
+        first = True
+        with open(out_path, 'w', encoding='utf-8') as fout:
+            for f in files:
+                with open(f, encoding='utf-8') as fin:
+                    header = fin.readline()
+                    if first:
+                        fout.write(header)
+                        first = False
+                    fout.write(fin.read())
+                f.unlink()
+        print(f"[consolidate]  {len(files)} files → {out_path.name}  ({out_path.stat().st_size / 1_048_576:.1f} MB)")
+
+
 def summarize_run(run_dir: Path):
     print(f"\n{'='*60}")
     print(f"  Batch Run Analysis — {run_dir.name}")
     print(f"{'='*60}\n")
 
-    df, n_batches = load_all_summaries(run_dir=run_dir)
+    # Load run parameters saved at batch start (falls back to empty dict for old runs)
+    import json
+    params_path = run_dir / 'run_params.json'
+    run_params  = json.loads(params_path.read_text()) if params_path.exists() else {}
+
+    # Load summary data: prefer consolidated summary.csv, fall back to per-window files
+    consolidated_path = run_dir / 'summary.csv'
+    if consolidated_path.exists():
+        combined = pd.read_csv(consolidated_path, low_memory=False)
+        combined['profit_factor_capped'] = combined['profit_factor'].clip(upper=PF_CAP)
+        n_batches = int(combined['batch_no'].nunique()) if 'batch_no' in combined.columns else len(
+            list(run_dir.glob('*_run.log'))
+        )
+        print(f"[load]  summary.csv  |  {n_batches} runs  |  {len(combined):,} rows")
+        df = combined
+    else:
+        df, n_batches = load_all_summaries(run_dir=run_dir)
+
+    # Force numeric dtypes on key columns.
+    # Empty summary files (all rows filtered out in low-trade windows) cause
+    # pd.concat to infer object dtype for columns it never sees data for.
+    numeric_cols = [
+        'number_of_trades', 'win_rate', 'total_pnl', 'avg_pnl',
+        'avg_bars_held', 'profit_factor', 'profit_factor_capped',
+        'sharpe', 'max_drawdown', 'avg_stock_pnl', 'avg_option_pnl',
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
     # Rename columns back to internal names used by aggregate() in utils.py.
     # Summary CSVs on disk use display names; we reverse them for analysis.
@@ -722,7 +786,7 @@ def summarize_run(run_dir: Path):
 
     print("\n[report]  Writing markdown ...")
     write_markdown_report(models_df, variants_df, category_dfs, pair_dfs,
-                          n_batches, len(df), run_dir)
+                          n_batches, len(df), run_dir, run_params)
 
     # ── Append to persistent all_runs.csv ────────────────────────────────────
     print("\n[all_runs] Appending to all_runs.csv ...")
@@ -777,7 +841,7 @@ def summarize_run(run_dir: Path):
 
 if __name__ == '__main__':
     _parser = argparse.ArgumentParser(
-        description='Run all 1,221 CC-variant models (12 variants each) across 100 windows.'
+        description='Run all 1,221 CC-variant models (18 variants each) across N windows.'
     )
     _parser.add_argument(
         '--seed', type=int, default=None,
@@ -799,47 +863,116 @@ if __name__ == '__main__':
         '--window-days', type=int, default=14,
         help='Calendar days per test window (default: 14)',
     )
+    _parser.add_argument(
+        '--windows', type=int, default=100,
+        help='Number of test windows to run (default: 100; max is date-range / window-days)',
+    )
+    _parser.add_argument(
+        '--buyback', type=float, default=0.50,
+        help='Option ask threshold to trigger a buyback exit (default: 0.50)',
+    )
+    _parser.add_argument(
+        '--expiry-label', nargs='+', default=None,
+        metavar='LABEL',
+        help='Expiry weeks to include: w0 w1 w2 (default: all three)',
+    )
+    _parser.add_argument(
+        '--strike-label', nargs='+', default=None,
+        metavar='LABEL',
+        help='Strike labels to include: s-2 s-1 s-0 s+0 s+1 s+2 (default: all six)',
+    )
     _args = _parser.parse_args()
+
+    _expiry_filter = _args.expiry_label or S.EXPIRY_WEEKS
+    _strike_filter = _args.strike_label or S.STRIKE_LABELS
+
+    _invalid_expiry = [e for e in _expiry_filter if e not in S.EXPIRY_WEEKS]
+    _invalid_strike = [s for s in _strike_filter if s not in S.STRIKE_LABELS]
+    if _invalid_expiry:
+        _parser.error(f"Invalid --expiry-label value(s): {_invalid_expiry}. Choose from {S.EXPIRY_WEEKS}")
+    if _invalid_strike:
+        _parser.error(f"Invalid --strike-label value(s): {_invalid_strike}. Choose from {S.STRIKE_LABELS}")
+
+    S.OPTION_VARIANTS = [(ew, sl) for ew in _expiry_filter for sl in _strike_filter]
+    OPTION_VARIANTS   = S.OPTION_VARIANTS   # keep local alias in sync
 
     RANDOM_SEED = _args.seed if _args.seed is not None else secrets.randbelow(2**32)
     N_WORKERS   = _args.workers
     DATA_FIRST  = datetime.date.fromisoformat(_args.data_first)
     DATA_LAST   = datetime.date.fromisoformat(_args.data_last)
     WINDOW_DAYS = _args.window_days
-
-    print(f"[main]  Master seed : {RANDOM_SEED}")
-    print(f"[main]  Workers     : {N_WORKERS}")
-    print(f"[main]  Variants    : {len(OPTION_VARIANTS)} per combo  "
-          f"(w0/w1/w2 × s-2/s-1/s-0/s+0/s+1/s+2)")
+    N_WINDOWS   = _args.windows
+    S.OPTION_EXIT_PRICE = _args.buyback
 
     run_ts  = datetime.datetime.now().strftime('%m%d%H%M')
     run_dir = REPORTS_DIR / run_ts
     run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[main]  Output directory: {run_dir}")
+
+    print(f"[main]  Master seed : {RANDOM_SEED}")
+    print(f"[main]  Workers     : {N_WORKERS}")
+    print(f"[main]  Windows     : {N_WINDOWS}  ({WINDOW_DAYS}-day each)")
+    print(f"[main]  Date range  : {DATA_FIRST} → {DATA_LAST}")
+    print(f"[main]  Buyback     : ${S.OPTION_EXIT_PRICE:.2f}")
+    print(f"[main]  Expiry      : {_expiry_filter}")
+    print(f"[main]  Strike      : {_strike_filter}")
+    print(f"[main]  Variants    : {len(S.OPTION_VARIANTS)}")
+    print(f"[main]  Output dir  : {run_dir}")
+
+    # Save run parameters so summarize_run can include them in the report,
+    # even when called standalone after the batch completes.
+    import json
+    _run_params = {
+        'run_ts':        run_ts,
+        'random_seed':   RANDOM_SEED,
+        'n_workers':     N_WORKERS,
+        'n_windows':     N_WINDOWS,
+        'window_days':   WINDOW_DAYS,
+        'date_first':    str(DATA_FIRST),
+        'date_last':     str(DATA_LAST),
+        'buyback':       S.OPTION_EXIT_PRICE,
+        'expiry_labels': _expiry_filter,
+        'strike_labels': _strike_filter,
+        'n_variants':    len(S.OPTION_VARIANTS),
+        'n_sample':      S.N_SAMPLE,
+        'commission':    S.COMMISSION,
+        'shares':        S.SHARES,
+        'argv':          sys.argv,
+    }
+    (run_dir / 'run_params.json').write_text(
+        json.dumps(_run_params, indent=2), encoding='utf-8'
+    )
 
     # Build signals CSV in the main process before spawning workers.
     print("[main]  Loading/building signals CSV ...")
     S.load_or_build_signals()
     print("[main]  Signals ready.\n")
 
-    # ── Generate all 100 window specs ─────────────────────────────────────────
+    # ── Generate N_WINDOWS window specs ───────────────────────────────────────
     max_start  = DATA_LAST - datetime.timedelta(days=WINDOW_DAYS)
     total_days = (max_start - DATA_FIRST).days
 
+    if N_WINDOWS > total_days:
+        raise ValueError(
+            f"--windows {N_WINDOWS} exceeds available unique start days ({total_days}) "
+            f"for date range {DATA_FIRST} → {DATA_LAST} with --window-days {WINDOW_DAYS}. "
+            f"Reduce --windows or extend the date range."
+        )
+
     master_rng = np.random.default_rng(RANDOM_SEED)
-    offsets    = master_rng.choice(total_days, size=100, replace=False).tolist()
-    run_seeds  = master_rng.integers(1, 10_000, size=100).tolist()
+    offsets    = master_rng.choice(total_days, size=N_WINDOWS, replace=False).tolist()
+    run_seeds  = master_rng.integers(1, 10_000, size=N_WINDOWS).tolist()
     runs       = sorted(zip(offsets, run_seeds), key=lambda x: x[0])
 
     window_args = []
     for seq_no, (offset, seed) in enumerate(runs, 1):
         date_start = (DATA_FIRST + datetime.timedelta(days=int(offset))).strftime('%Y-%m-%d')
         date_end   = (DATA_FIRST + datetime.timedelta(days=int(offset) + WINDOW_DAYS)).strftime('%Y-%m-%d')
-        window_args.append((seq_no, run_dir, date_start, date_end, int(seed)))
+        window_args.append((seq_no, run_dir, date_start, date_end, int(seed),
+                            _args.buyback, _expiry_filter, _strike_filter))
         print(f"  [{seq_no:>3}]  {date_start} -> {date_end}  seed={seed}")
 
     # ── Dispatch to worker pool ────────────────────────────────────────────────
-    print(f"\n[main]  Submitting {len(window_args)} windows to {N_WORKERS} workers ...\n")
+    print(f"\n[main]  Submitting {N_WINDOWS} windows to {N_WORKERS} workers ...\n")
     completed = 0
     failed    = 0
 
@@ -857,6 +990,10 @@ if __name__ == '__main__':
                   f"({completed} ok, {failed} failed)")
 
     print(f"\n[main]  All windows finished.  {completed} ok / {failed} failed.")
+
+    # ── Consolidate per-window CSVs into single files ─────────────────────────
+    print("\n[consolidate] Merging per-window CSVs ...")
+    consolidate_csvs(run_dir)
 
     # ── Post-run analysis ─────────────────────────────────────────────────────
     summarize_run(run_dir)
