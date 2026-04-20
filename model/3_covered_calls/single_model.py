@@ -67,7 +67,9 @@ OPTIONS_DIR  = _BASE / 'data/options'
 N_SAMPLE              = 10_000
 RANDOM_SEED           = 42
 COMMISSION            = 2.00
-OPTION_EXIT_PRICE     = 0.50    # buyback threshold
+BUYBACK_TV            = 0.25    # buyback threshold on option-ask time value
+CC_TV_MIN             = 1.00    # entry gate: minimum opening time value
+CC_TV_MAX             = 3.00    # entry gate: maximum opening time value
 MAX_QUOTE_AGE_MINUTES = 30      # freshness guard — reject stale option open quote
 EXPIRY_QUOTE_MIN_HOUR = 15      # expiry-day quote at or after 3 PM
 SHARES                = 100     # always 100 shares (fixed)
@@ -531,7 +533,11 @@ def simulate_all_variants(
         last_bid     = float(last['avg_bid'])
         for key, variant in open_variants.items():
             late_ask = get_option_price_at(variant['opt_data'], last_time_np, 'avg_ask')
-            if late_ask is not None and late_ask < OPTION_EXIT_PRICE:
+            late_tv  = (
+                late_ask - max(0.0, last_bid - variant['strike'])
+                if late_ask is not None else None
+            )
+            if late_tv is not None and late_tv < BUYBACK_TV:
                 closed_results[key] = _build_result(
                     variant, last_str, last_bid,
                     'buyback_late_data', late_ask, 0, entry_price, shares

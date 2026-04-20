@@ -1,9 +1,0 @@
-start gateway:
-  sudo systemctl start ibgateway
-  sudo systemctl status ibgateway --no-pager
-  tail -f ~/logs/ibgateway.log
-
-=== Remote install completed ===
-SSH:    ssh -i "/Users/muthu/.ssh/Muthu-06Apr25.pem" ec2-user@ec2-13-218-34-79.compute-1.amazonaws.com
-Start:  ssh -i "/Users/muthu/.ssh/Muthu-06Apr25.pem" ec2-user@ec2-13-218-34-79.compute-1.amazonaws.com 'sudo systemctl start ibgateway'
-Logs:   ssh -i "/Users/muthu/.ssh/Muthu-06Apr25.pem" ec2-user@ec2-13-218-34-79.compute-1.amazonaws.com 'tail -f ~/logs/ibgateway.log'
