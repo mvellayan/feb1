@@ -562,8 +562,12 @@ def simulate_all_variants(
                 opt_data, bar_times_np, 'avg_ask', MAX_QUOTE_AGE_MINUTES
             )
 
-            # Buyback: first bar with a valid (non-NaN) ask below threshold
-            buyback_mask = ~np.isnan(opt_asks) & (opt_asks < OPTION_EXIT_PRICE)
+            # Buyback: first bar whose ask-side time value falls below the threshold
+            #   tv_ask = option_ask - max(0, avg_bid - strike)
+            strike   = variant['strike']
+            intrinsic = np.maximum(0.0, bar_avg_bids - strike)
+            tv_ask    = opt_asks - intrinsic
+            buyback_mask = ~np.isnan(tv_ask) & (tv_ask < BUYBACK_TV)
             buyback_idx  = int(np.argmax(buyback_mask)) if buyback_mask.any() else n_future
 
             # Expiry: first bar at or after 3 PM on expiry Friday
@@ -581,7 +585,11 @@ def simulate_all_variants(
                 exit_bid  = float(bar_avg_bids[-1])
                 bars_held = n_future
                 late_ask  = get_option_price_at(opt_data, bar_times_np[-1], 'avg_ask')
-                if late_ask is not None and late_ask < OPTION_EXIT_PRICE:
+                late_tv   = (
+                    late_ask - max(0.0, exit_bid - strike)
+                    if late_ask is not None else None
+                )
+                if late_tv is not None and late_tv < BUYBACK_TV:
                     cc_reason = 'buyback_late_data'
                     cc_price  = late_ask
                 else:
@@ -998,6 +1006,27 @@ def run_combo(
         # Find all 12 variants
         all_variants = find_all_cc_variants(entry_date, entry_ts, entry_price)
 
+        # Entry TV gate: drop variants whose opening time value is outside
+        # [CC_TV_MIN, CC_TV_MAX]. Variants missing an open_price also fail here.
+        cc_tv_by_key = {}
+        for key, variant in list(all_variants.items()):
+            if variant is None:
+                continue
+            op_price = variant.get('open_price')
+            strike_v = variant.get('strike')
+            if op_price is None or strike_v is None:
+                all_variants[key] = None
+                continue
+            cc_tv = op_price - max(0.0, entry_price - strike_v)
+            if cc_tv < CC_TV_MIN or cc_tv > CC_TV_MAX:
+                all_variants[key] = None
+                continue
+            cc_tv_by_key[key] = round(cc_tv, 4)
+
+        # If every variant failed the TV gate, skip this entry entirely
+        if not any(v is not None for v in all_variants.values()):
+            continue
+
         # Build context slice from entry day through end of df
         df_slice, entry_iloc = _build_cc_context(df, idx)
         if df_slice is None or entry_iloc is None:
@@ -1044,6 +1073,8 @@ def run_combo(
             stock_cost     = SHARES * entry_price if exit_price is not None else None
             stock_proceeds = SHARES * exit_price  if exit_price is not None else None
 
+            cc_tv_entry = cc_tv_by_key.get(key)
+
             trades.append({
                 **base,
                 'leg':          'stock',
@@ -1053,6 +1084,7 @@ def run_combo(
                 'strike':       strike,
                 'expiry_date':  str(expiry_date) if expiry_date else None,
                 'cc_open_price': open_price,
+                'cc_tv_at_entry': cc_tv_entry,
                 'exit_time':    exit_time,
                 'exit_price':   exit_price,
                 'exit_reason':  exit_reason,
