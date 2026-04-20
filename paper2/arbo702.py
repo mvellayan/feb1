@@ -61,7 +61,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from ibapi.client import EClient
-from ibapi.contract import Contract
+from ibapi.contract import ComboLeg, Contract
 from ibapi.order import Order
 from ibapi.wrapper import EWrapper
 
@@ -90,9 +90,13 @@ from signals import add_buy_signals  # noqa: E402
 
 PARAMS_FILE = _HERE / 'params.json'
 
-_DEFAULT_PARAMS = {
-    'symbol':              'AAPL',
-    'starting_cash':       500_000,
+_STRATEGY_KEYS = (
+    'shares_per_position', 'cooldown_minutes',
+    'cc_tv_min', 'cc_tv_max', 'buyback_tv',
+    'expiry_label', 'strike_label',
+)
+
+_DEFAULT_STRATEGY = {
     'shares_per_position': 100,
     'cooldown_minutes':    60,
     'cc_tv_min':           2.5,
@@ -100,10 +104,16 @@ _DEFAULT_PARAMS = {
     'buyback_tv':          0.5,
     'expiry_label':        'w0',
     'strike_label':        's-2',
-    'host':                '127.0.0.1',
-    'port':                7497,
-    'client_id':           2,
-    'retention_days':      30,
+}
+
+_DEFAULT_PARAMS = {
+    'symbol':         'AAPL',
+    'starting_cash':  500_000,
+    'strategies':     [dict(_DEFAULT_STRATEGY)],
+    'host':           '127.0.0.1',
+    'port':           7497,
+    'client_id':      2,
+    'retention_days': 30,
 }
 
 
@@ -111,14 +121,40 @@ def load_params() -> dict:
     if not PARAMS_FILE.exists():
         PARAMS_FILE.write_text(json.dumps(_DEFAULT_PARAMS, indent=2))
     p = json.loads(PARAMS_FILE.read_text())
-    # Fill missing keys with defaults
+
+    # Fill top-level defaults (but NOT strategies — that's handled below)
     for k, v in _DEFAULT_PARAMS.items():
-        p.setdefault(k, v)
-    # Validate shares is a multiple of 100
-    shares = int(p['shares_per_position'])
-    if shares % 100 != 0 or shares <= 0:
-        raise ValueError(f"shares_per_position must be positive multiple of 100: {shares}")
-    p['shares_per_position'] = shares
+        if k != 'strategies':
+            p.setdefault(k, v)
+
+    # Legacy / single-strategy fallback: a flat params file gets wrapped
+    strategies = p.get('strategies')
+    if not strategies:
+        flat = {k: p[k] for k in _STRATEGY_KEYS if k in p}
+        if flat:
+            print("[params] legacy single-strategy format — wrapping in strategies[]")
+            strategies = [flat]
+        else:
+            strategies = [dict(_DEFAULT_STRATEGY)]
+
+    # Validate & fill defaults on each strategy
+    cleaned = []
+    for i, s in enumerate(strategies):
+        if not isinstance(s, dict):
+            raise ValueError(f"strategies[{i}] is not an object: {s!r}")
+        merged = {**_DEFAULT_STRATEGY, **s}
+        shares = int(merged['shares_per_position'])
+        if shares % 100 != 0 or shares <= 0:
+            raise ValueError(f"strategies[{i}].shares_per_position must be positive multiple of 100: {shares}")
+        merged['shares_per_position'] = shares
+        merged['cooldown_minutes']    = int(merged['cooldown_minutes'])
+        merged['cc_tv_min']           = float(merged['cc_tv_min'])
+        merged['cc_tv_max']           = float(merged['cc_tv_max'])
+        merged['buyback_tv']          = float(merged['buyback_tv'])
+        if merged['cc_tv_min'] > merged['cc_tv_max']:
+            raise ValueError(f"strategies[{i}] cc_tv_min > cc_tv_max")
+        cleaned.append(merged)
+    p['strategies'] = cleaned
     return p
 
 
@@ -145,6 +181,10 @@ REQ_VIX_MKTDATA   = 3
 REQ_STK_RTBARS    = 4
 REQ_HIST          = 5
 _DYN_REQ_START    = 100
+
+# BAG (combo) order pricing — per-share buffers on the net combo price
+BAG_LMT_ENTRY_BUFFER = 0.10   # entry combo = BUY  → LMT = net_debit  + buffer
+BAG_LMT_EXIT_BUFFER  = 0.10   # exit  combo = SELL → LMT = net_credit − buffer
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FILE PATHS
@@ -614,6 +654,99 @@ def _market_order(action: str, qty: int) -> Order:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BAG (combo) ORDER HELPERS — atomic buy-write / close-buy-write
+# ══════════════════════════════════════════════════════════════════════════════
+
+_stock_conid_cache: int | None = None
+
+
+def get_stock_conid(app, symbol: str = None,
+                    timeout: float = 10.0) -> int | None:
+    """One-shot stock conId lookup via reqContractDetails; cached for the session."""
+    global _stock_conid_cache
+    if _stock_conid_cache is not None:
+        return _stock_conid_cache
+    sym = symbol or SYMBOL
+    c = Contract()
+    c.symbol      = sym
+    c.secType     = 'STK'
+    c.exchange    = 'SMART'
+    c.primaryExch = 'NASDAQ'
+    c.currency    = 'USD'
+    rid = app.next_req_id()
+    app._cd_rows[rid] = []
+    app._cd_done[rid] = threading.Event()
+    app.reqContractDetails(rid, c)
+    if not app._cd_done[rid].wait(timeout=timeout):
+        log.warning(f"reqContractDetails timed out for stock {sym}")
+    rows = app._cd_rows.pop(rid, [])
+    app._cd_done.pop(rid, None)
+    if rows:
+        _stock_conid_cache = int(rows[0]['conId'])
+        log.info(f"[conid] {sym} stock conId = {_stock_conid_cache}")
+    return _stock_conid_cache
+
+
+def option_conid_from_chain(chain_df: pd.DataFrame, strike: float,
+                            expiry_ib: str) -> int | None:
+    """Look up the cached option conId in contracts_{yymmdd}.csv."""
+    sub = chain_df[(chain_df['expiry'] == expiry_ib) &
+                   (chain_df['strike'].astype(float) == float(strike)) &
+                   (chain_df['right'] == 'C')]
+    if sub.empty:
+        return None
+    return int(sub.iloc[0]['conId'])
+
+
+def _buywrite_bag(stock_conid: int, option_conid: int) -> Contract:
+    """
+    BAG contract for a covered-call buy-write:
+      leg 1: 100 shares stock   (BUY for entry, SELL for exit via combo action)
+      leg 2:   1 call option    (SELL for entry, BUY  for exit via combo action)
+    Ratio 100:1 → 1 combo unit = 1 covered-call pair.
+    """
+    bag = Contract()
+    bag.symbol   = SYMBOL
+    bag.secType  = 'BAG'
+    bag.currency = 'USD'
+    bag.exchange = 'SMART'
+
+    stk_leg = ComboLeg()
+    stk_leg.conId     = stock_conid
+    stk_leg.ratio     = 100
+    stk_leg.action    = 'BUY'     # BAG action=BUY/SELL flips this effectively
+    stk_leg.exchange  = 'SMART'
+    stk_leg.openClose = 0
+
+    opt_leg = ComboLeg()
+    opt_leg.conId     = option_conid
+    opt_leg.ratio     = 1
+    opt_leg.action    = 'SELL'
+    opt_leg.exchange  = 'SMART'
+    opt_leg.openClose = 0
+
+    bag.comboLegs = [stk_leg, opt_leg]
+    return bag
+
+
+def _bag_limit_order(action: str, quantity: int, lmt_price: float) -> Order:
+    """
+    LMT order for a BAG combo.  quantity = number of 100-share combo units.
+      action='BUY'  → pay up to lmt_price per share (net debit for entry)
+      action='SELL' → accept at least lmt_price per share (net credit for exit)
+    """
+    o = Order()
+    o.action        = action
+    o.orderType     = 'LMT'
+    o.totalQuantity = quantity
+    o.lmtPrice      = round(lmt_price, 2)
+    o.tif           = 'DAY'
+    o.eTradeOnly    = False
+    o.firmQuoteOnly = False
+    return o
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # EXPIRY / STRIKE RESOLUTION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -813,17 +946,21 @@ def update_today_partial(df_raw: pd.DataFrame, today: date):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _PS_COLS = [
-    'position_id',
+    'position_id', 'strategy_id',
     'entry_time', 'entry_price', 'entry_wap', 'shares', 'cash_used',
+    'buyback_tv',          # copied from strategy at entry; governs exit
     'atr_at_entry', 'rsi_at_entry', 'adx_at_entry', 'vwap_at_entry',
-    'pending_order_id', 'pending_bars',
+    'pending_order_id',    # entry BAG order (cleared once filled)
+    'pending_bars',
     'cc_symbol', 'cc_local_symbol', 'cc_strike', 'cc_expiry', 'cc_right',
+    'cc_conid',            # option conId — needed to rebuild exit BAG
     'cc_open_price', 'cc_open_time', 'cc_tv_at_entry',
-    'cc_mktdata_req_id', 'cc_pending_order_id',
+    'cc_mktdata_req_id',
+    'cc_pending_order_id', # exit BAG order (cleared once filled → row drops)
 ]
 
 _TX_COLS = [
-    'timestamp', 'position_id', 'leg', 'action',
+    'timestamp', 'position_id', 'strategy_id', 'leg', 'action',
     'symbol', 'local_symbol', 'sec_type', 'quantity',
     'price', 'order_id', 'reason',
 ]
@@ -832,13 +969,18 @@ _TX_COLS = [
 def load_ps() -> pd.DataFrame:
     if not POS_SUPPORT_CSV.exists():
         return pd.DataFrame(columns=_PS_COLS)
-    return pd.read_csv(
+    df = pd.read_csv(
         POS_SUPPORT_CSV,
         dtype={'position_id': str, 'pending_order_id': str,
                'cc_mktdata_req_id': str, 'cc_pending_order_id': str,
                'cc_expiry': str},
         low_memory=False,
     )
+    # Backfill any columns added in later releases
+    for c in _PS_COLS:
+        if c not in df.columns:
+            df[c] = None
+    return df[_PS_COLS]
 
 
 def save_ps(df: pd.DataFrame):
@@ -929,8 +1071,10 @@ def sync_on_startup(app: IBApp, params: dict) -> pd.DataFrame:
 
     # Drop CSV rows with no matching stock or CC coverage in IB
     keep_rows = []
+    # Default shares = first strategy's shares (only used for rows missing the field)
+    default_shares = int(params['strategies'][0]['shares_per_position'])
     for i, row in ps.iterrows():
-        shares = int(float(row.get('shares') or params['shares_per_position']))
+        shares = int(float(row.get('shares') or default_shares))
         cc_sym = str(row.get('cc_local_symbol', '') or '')
         has_cc_in_csv = cc_sym not in ('', 'nan', 'None')
         if has_cc_in_csv:
@@ -1023,6 +1167,11 @@ def _has_cc(row) -> bool:
     return str(row.get('cc_symbol', '')) not in ('', 'nan', 'None')
 
 
+def _has_exit_pending(row) -> bool:
+    oid = str(row.get('cc_pending_order_id', ''))
+    return oid not in ('', 'nan', 'None')
+
+
 def _composite_fires(last_row: pd.Series) -> bool:
     """(any bsig_trend) AND (any bsig_momentum) on the given row."""
     try:
@@ -1040,44 +1189,118 @@ def _last_entry_time(ps: pd.DataFrame) -> datetime | None:
     return times.max() if not times.empty else None
 
 
+def _last_entry_time_for_strategy(ps: pd.DataFrame, strategy_id: int) -> datetime | None:
+    """Latest entry_time across positions that belong to the given strategy."""
+    if ps.empty:
+        return None
+    sub = ps[pd.to_numeric(ps['strategy_id'], errors='coerce') == strategy_id]
+    if sub.empty:
+        return None
+    times = pd.to_datetime(sub['entry_time'], errors='coerce').dropna()
+    return times.max() if not times.empty else None
+
+
 def cancel_stale_orders(app: IBApp, ps: pd.DataFrame) -> pd.DataFrame:
-    """Confirm fills and drop orphan pending rows after 2 unconfirmed bars."""
+    """
+    Track BAG order lifecycles:
+      • Entry BAG (pending_order_id):  on fill → clear pending, mark position
+        as fully open.  If unfilled after 2 bars → cancel + drop row (nothing
+        to close, BAG is atomic).
+      • Exit BAG (cc_pending_order_id): on fill → drop row (position closed).
+        If unfilled after 5 bars → cancel, clear cc_pending_order_id, and the
+        next buyback check will re-submit with fresh prices.
+    Entry and exit pending states are mutually exclusive on a given row.
+    """
     if ps.empty:
         return ps
     ps = ps.copy()
     drops: list[int] = []
+
     for i, row in ps.iterrows():
-        if not _has_pending(row):
-            continue
-        try:
-            oid = int(float(row['pending_order_id']))
-        except (ValueError, TypeError):
-            drops.append(i)
-            continue
-        st = app.order_status.get(oid, {})
-        status = st.get('status', '')
-        if status == 'Filled':
-            fill = float(st.get('avg_fill', row['entry_price']))
-            ps.at[i, 'entry_price']      = fill
-            ps.at[i, 'entry_wap']        = fill
-            ps.at[i, 'cash_used']        = fill * float(row['shares'])
-            ps.at[i, 'pending_order_id'] = None
-            ps.at[i, 'pending_bars']     = 0
-            log.info(f"[fill] pos={row['position_id']} stock oid={oid} @ {fill}")
-        elif status == '':
-            bars = int(float(row.get('pending_bars') or 0)) + 1
-            ps.at[i, 'pending_bars'] = bars
-            if bars >= 2:
-                log.warning(f"[orders] stock oid={oid} no status after {bars} bars — dropping row")
-                app.cancelOrder(oid)
+        # ── Exit BAG pending ──────────────────────────────────────────────
+        if _has_exit_pending(row):
+            try:
+                oid = int(float(row['cc_pending_order_id']))
+            except (ValueError, TypeError):
+                ps.at[i, 'cc_pending_order_id'] = None
+                continue
+            st     = app.order_status.get(oid, {})
+            status = st.get('status', '')
+            pos_id = row['position_id']
+
+            if status == 'Filled':
+                fill = float(st.get('avg_fill', 0.0))
+                log.info(f"[exit fill] pos={pos_id} exit BAG oid={oid} filled "
+                         f"@ net_credit={fill:.4f}/share")
+                _cancel_cc_sub(app, row)
                 drops.append(i)
-        elif status in ('PreSubmitted', 'Submitted'):
-            log.info(f"[orders] unfilled stock oid={oid} status={status} — cancel + drop row")
-            app.cancelOrder(oid)
-            drops.append(i)
-        else:
-            log.info(f"[orders] stock oid={oid} status={status} — dropping row")
-            drops.append(i)
+            elif status in ('', 'PreSubmitted', 'Submitted'):
+                bars = int(float(row.get('pending_bars') or 0)) + 1
+                ps.at[i, 'pending_bars'] = bars
+                if bars >= 5:
+                    log.warning(f"[orders] exit BAG oid={oid} unfilled {status or '(no status)'} "
+                                f"after {bars} bars — cancel, will retry next buyback check")
+                    try:
+                        app.cancelOrder(oid)
+                    except Exception:
+                        pass
+                    ps.at[i, 'cc_pending_order_id'] = None
+                    ps.at[i, 'pending_bars']        = 0
+            else:
+                # Cancelled / Inactive / etc. — clear pending, let next bar retry
+                log.info(f"[orders] exit BAG oid={oid} status={status} — "
+                         f"clearing, next buyback check will retry")
+                ps.at[i, 'cc_pending_order_id'] = None
+                ps.at[i, 'pending_bars']        = 0
+            continue
+
+        # ── Entry BAG pending ─────────────────────────────────────────────
+        if _has_pending(row):
+            try:
+                oid = int(float(row['pending_order_id']))
+            except (ValueError, TypeError):
+                drops.append(i)
+                continue
+            st     = app.order_status.get(oid, {})
+            status = st.get('status', '')
+            pos_id = row['position_id']
+
+            if status == 'Filled':
+                fill = float(st.get('avg_fill', 0.0))
+                log.info(f"[fill] pos={pos_id} entry BAG oid={oid} filled "
+                         f"@ net_debit={fill:.4f}/share")
+                ps.at[i, 'pending_order_id'] = None
+                ps.at[i, 'pending_bars']     = 0
+                # Update cash_used from the actual net debit per share × shares.
+                # BAG fill avg is the per-share net debit (stock − premium).
+                if fill > 0:
+                    ps.at[i, 'cash_used'] = fill * float(row['shares'])
+            elif status == '':
+                bars = int(float(row.get('pending_bars') or 0)) + 1
+                ps.at[i, 'pending_bars'] = bars
+                if bars >= 2:
+                    log.warning(f"[orders] entry BAG oid={oid} no status after {bars} bars "
+                                f"— cancel + drop row (atomic, nothing to unwind)")
+                    try:
+                        app.cancelOrder(oid)
+                    except Exception:
+                        pass
+                    drops.append(i)
+            elif status in ('PreSubmitted', 'Submitted'):
+                bars = int(float(row.get('pending_bars') or 0)) + 1
+                ps.at[i, 'pending_bars'] = bars
+                if bars >= 2:
+                    log.info(f"[orders] entry BAG oid={oid} {status} after {bars} bars "
+                             f"— cancel + drop row")
+                    try:
+                        app.cancelOrder(oid)
+                    except Exception:
+                        pass
+                    drops.append(i)
+            else:
+                log.info(f"[orders] entry BAG oid={oid} status={status} — dropping row")
+                drops.append(i)
+
     if drops:
         ps = ps.drop(index=drops).reset_index(drop=True)
     return ps
@@ -1087,18 +1310,26 @@ def check_cc_buybacks(app: IBApp, ps: pd.DataFrame, bar: dict,
                       bar_dt: datetime, params: dict) -> pd.DataFrame:
     """
     TV-based buyback per open CC: option_ask − max(0, stock_bid − strike) < buyback_tv.
-    On trigger: MKT BUY to close the call, MKT SELL the stock.
+    Each position uses its own buyback_tv (copied from its strategy at entry time).
+    On trigger: submit a single atomic BAG order (SELL combo) — buy the call
+    back AND sell the stock in one exchange-side round.  The row is NOT
+    dropped here; cancel_stale_orders drops it when the exit BAG fills.
     """
     if ps.empty:
         return ps
     bar_bid = float(bar['avg_bid'])
-    buyback_tv = float(params['buyback_tv'])
     ps = ps.copy()
-    drops: list[int] = []
 
     for i, row in ps.iterrows():
         if not _has_cc(row):
             continue
+        # Skip if an exit BAG is already outstanding (prevent duplicate orders)
+        if _has_exit_pending(row):
+            continue
+        # Skip if entry BAG hasn't filled yet (no CC to buy back)
+        if _has_pending(row):
+            continue
+
         cc_sym = str(row['cc_local_symbol'])
         try:
             cc_rid = int(float(row.get('cc_mktdata_req_id') or 0))
@@ -1110,46 +1341,65 @@ def check_cc_buybacks(app: IBApp, ps: pd.DataFrame, bar: dict,
             log.debug(f"[cc monitor] pos={row['position_id']} {cc_sym} no ask yet")
             continue
 
-        strike = float(row['cc_strike'])
+        strike    = float(row['cc_strike'])
         intrinsic = max(0.0, bar_bid - strike)
-        tv = ask - intrinsic
+        tv        = ask - intrinsic
+        try:
+            buyback_tv = float(row['buyback_tv'])
+        except (ValueError, TypeError):
+            buyback_tv = float(params['strategies'][0]['buyback_tv'])
         log.debug(f"[cc monitor] pos={row['position_id']} {cc_sym} ask={ask} "
-                  f"tv={tv:.4f}")
+                  f"tv={tv:.4f}  threshold={buyback_tv}")
 
         if tv >= buyback_tv:
             continue
 
-        shares = int(float(row['shares']))
-        pos_id = row['position_id']
-        log.info(f"[CC buyback] pos={pos_id} {cc_sym} tv={tv:.4f} < {buyback_tv}")
+        shares   = int(float(row['shares']))
+        pos_id   = row['position_id']
+        strat_id = row.get('strategy_id', '')
 
-        _cancel_cc_sub(app, row)
+        # Resolve conIds for exit BAG
+        try:
+            option_conid = int(float(row.get('cc_conid') or 0))
+        except (ValueError, TypeError):
+            option_conid = 0
+        if not option_conid:
+            log.warning(f"[CC buyback] pos={pos_id} — no cc_conid on row; "
+                        f"cannot build exit BAG this bar")
+            continue
+        stock_conid = get_stock_conid(app)
+        if stock_conid is None:
+            log.warning(f"[CC buyback] pos={pos_id} — no stock conId; skip")
+            continue
 
-        # Resolve contract from strike+expiry fields (do not set localSymbol)
-        opt = _option_contract(strike, str(row['cc_expiry']))
-        cc_oid = app.next_order_id()
-        app.placeOrder(cc_oid, opt, _market_order('BUY', 1))
+        # Atomic BAG: SELL the combo.  Net credit per share = stock_bid − option_ask.
+        quantity             = shares // 100
+        net_credit_per_share = float(bar_bid) - float(ask)
+        lmt_price            = net_credit_per_share - BAG_LMT_EXIT_BUFFER
+
+        bag     = _buywrite_bag(stock_conid, option_conid)
+        order   = _bag_limit_order('SELL', quantity, lmt_price)
+        bag_oid = app.next_order_id()
+        app.placeOrder(bag_oid, bag, order)
+        log.info(f"[CC buyback] pos={pos_id} strat={strat_id} {cc_sym}  "
+                 f"tv={tv:.4f} < {buyback_tv}  "
+                 f"BAG SELL qty={quantity} stk_bid={bar_bid} opt_ask={ask} "
+                 f"lmt_net_credit={lmt_price:.2f}/share  bag_oid={bag_oid}")
         _log_txn({
             'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
-            'leg': 'option', 'action': 'BUY', 'symbol': SYMBOL,
-            'local_symbol': cc_sym, 'sec_type': 'OPT', 'quantity': 1,
-            'price': ask, 'order_id': cc_oid,
+            'strategy_id': strat_id,
+            'leg': 'combo', 'action': 'SELL', 'symbol': SYMBOL,
+            'local_symbol': f'BAG {SYMBOL}+{cc_sym}',
+            'sec_type': 'BAG', 'quantity': quantity,
+            'price': lmt_price, 'order_id': bag_oid,
             'reason': f'buyback_tv_{tv:.4f}',
         })
 
-        stk_oid = app.next_order_id()
-        app.placeOrder(stk_oid, _stk_contract(), _market_order('SELL', shares))
-        _log_txn({
-            'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
-            'leg': 'stock', 'action': 'SELL', 'symbol': SYMBOL,
-            'local_symbol': SYMBOL, 'sec_type': 'STK', 'quantity': shares,
-            'price': bar_bid, 'order_id': stk_oid,
-            'reason': 'buyback_close_stock',
-        })
-        drops.append(i)
+        # Mark exit as pending — row is kept until the BAG fills.
+        # pending_bars is reused to count bars waiting for the exit to fill.
+        ps.at[i, 'cc_pending_order_id'] = bag_oid
+        ps.at[i, 'pending_bars']        = 0
 
-    if drops:
-        ps = ps.drop(index=drops).reset_index(drop=True)
     return ps
 
 
@@ -1217,13 +1467,15 @@ def check_entry_signal(
     chain_df:  pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    If composite signal fires + cooldown OK + cash OK + TV in range,
-    open a new position (sequential MKT BUY stock, MKT SELL CC).
+    Run the composite signal once, then evaluate every strategy in
+    params['strategies'] independently.  Each strategy has its own
+    shares_per_position, cooldown, TV range, buyback_tv, expiry_label,
+    strike_label.  Strategies fire in declared order; cash is a shared pool.
     """
     if _ses_minute(bar_dt) >= EOD_MINUTE or df_ext.empty:
         return ps
 
-    # Signal
+    # Composite signal — one evaluation per bar, shared by all strategies
     df_sig = add_buy_signals(df_ext.tail(10).copy())
     if df_sig.empty:
         return ps
@@ -1231,75 +1483,113 @@ def check_entry_signal(
     if not _composite_fires(last):
         return ps
 
-    # Cooldown
-    cd = timedelta(minutes=int(params['cooldown_minutes']))
-    last_entry = _last_entry_time(ps)
-    if last_entry is not None and (bar_dt - last_entry) < cd:
-        log.debug(f"[entry] skip — cooldown {bar_dt - last_entry} < {cd}")
-        return ps
-
-    # Cash
-    shares = int(params['shares_per_position'])
+    last_ext = df_ext.iloc[-1]
     entry_px = float(bar['avg_ask'])
-    cost = entry_px * shares
-    cash = current_cash(ps, float(params['starting_cash']))
-    if cash < cost:
-        log.info(f"[entry] signal fires — insufficient cash ${cash:.2f} < ${cost:.2f}; skip")
+
+    for strategy_id, strat in enumerate(params['strategies']):
+        ps = _try_open_for_strategy(
+            app, strategy_id, strat, ps, bar, bar_dt,
+            entry_px, last_ext, params, chain_df,
+        )
+    return ps
+
+
+def _try_open_for_strategy(
+    app:          IBApp,
+    strategy_id:  int,
+    strat:        dict,
+    ps:           pd.DataFrame,
+    bar:          dict,
+    bar_dt:       datetime,
+    entry_px:     float,
+    last_ext:     pd.Series,
+    params:       dict,
+    chain_df:     pd.DataFrame,
+) -> pd.DataFrame:
+    """Per-strategy entry evaluation; opens one position iff all gates pass."""
+    # Cooldown — per strategy
+    cd = timedelta(minutes=int(strat['cooldown_minutes']))
+    last_entry = _last_entry_time_for_strategy(ps, strategy_id)
+    if last_entry is not None and (bar_dt - last_entry) < cd:
+        log.debug(f"[entry] strat={strategy_id} skip — cooldown "
+                  f"{bar_dt - last_entry} < {cd}")
         return ps
 
-    # Resolve option contract
+    # Cash — shared pool
+    shares = int(strat['shares_per_position'])
+    cost   = entry_px * shares
+    cash   = current_cash(ps, float(params['starting_cash']))
+    if cash < cost:
+        log.info(f"[entry] strat={strategy_id} — insufficient cash "
+                 f"${cash:.2f} < ${cost:.2f}; skip")
+        return ps
+
+    # Resolve option contract for this strategy's expiry_label / strike_label
     try:
-        friday = resolve_expiry_friday(bar_dt.date(), params['expiry_label'])
+        friday = resolve_expiry_friday(bar_dt.date(), strat['expiry_label'])
     except ValueError as e:
-        log.warning(f"[entry] {e}")
+        log.warning(f"[entry] strat={strategy_id} bad expiry_label: {e}")
         return ps
     exp_ib = friday.strftime('%Y%m%d')
-    strike = resolve_strike(chain_df, exp_ib, entry_px, params['strike_label'])
+    strike = resolve_strike(chain_df, exp_ib, entry_px, strat['strike_label'])
     if strike is None:
-        log.info(f"[entry] signal fires — no {params['strike_label']} strike available "
-                 f"for {exp_ib} at entry ${entry_px:.2f}")
+        log.info(f"[entry] strat={strategy_id} — no {strat['strike_label']} "
+                 f"strike available for {exp_ib} at entry ${entry_px:.2f}")
         return ps
-    # Build the option contract from structured fields; do NOT set localSymbol
-    # (IB would then match strictly on the OSI string and reject non-canonical).
+
+    # Build contract from structured fields (no localSymbol)
     opt = _option_contract(strike, exp_ib)
     opt_display = f"{SYMBOL} {friday.strftime('%y%m%d')}C{int(strike * 1000):08d}"
 
     # Live quote → TV gate
     bid, ask = app.get_option_quote(opt)
     if bid is None:
-        log.info(f"[entry] signal fires — no option quote for strike={strike} exp={exp_ib}")
+        log.info(f"[entry] strat={strategy_id} — no option quote for "
+                 f"strike={strike} exp={exp_ib}")
         return ps
     cc_tv = bid - max(0.0, entry_px - strike)
-    if cc_tv < float(params['cc_tv_min']):
-        log.info(f"[entry] signal fires — cc_tv {cc_tv:.4f} < {params['cc_tv_min']}; skip")
+    if cc_tv < float(strat['cc_tv_min']):
+        log.info(f"[entry] strat={strategy_id} cc_tv {cc_tv:.4f} < "
+                 f"{strat['cc_tv_min']}; skip")
         return ps
-    if cc_tv > float(params['cc_tv_max']):
-        log.info(f"[entry] signal fires — cc_tv {cc_tv:.4f} > {params['cc_tv_max']}; skip")
+    if cc_tv > float(strat['cc_tv_max']):
+        log.info(f"[entry] strat={strategy_id} cc_tv {cc_tv:.4f} > "
+                 f"{strat['cc_tv_max']}; skip")
         return ps
 
-    # Sequential MKT orders
+    # Resolve conIds required for BAG legs
+    option_conid = option_conid_from_chain(chain_df, strike, exp_ib)
+    if option_conid is None:
+        log.warning(f"[entry] strat={strategy_id} — no option conId for "
+                    f"strike={strike} exp={exp_ib}; skip")
+        return ps
+    stock_conid = get_stock_conid(app)
+    if stock_conid is None:
+        log.warning(f"[entry] strat={strategy_id} — could not resolve stock conId; skip")
+        return ps
+
+    # Atomic BAG: BUY the combo (stock + short call).  quantity = 100-share units.
+    quantity            = shares // 100
+    net_debit_per_share = float(entry_px) - float(bid)
+    lmt_price           = net_debit_per_share + BAG_LMT_ENTRY_BUFFER
+
     pos_id  = _new_position_id()
-    stk_oid = app.next_order_id()
-    app.placeOrder(stk_oid, _stk_contract(), _market_order('BUY', shares))
-    log.info(f"[BUY] pos={pos_id} MKT BUY {shares} @~{entry_px}  stk_oid={stk_oid}")
+    bag     = _buywrite_bag(stock_conid, option_conid)
+    order   = _bag_limit_order('BUY', quantity, lmt_price)
+    bag_oid = app.next_order_id()
+    app.placeOrder(bag_oid, bag, order)
+    log.info(f"[BUY] pos={pos_id} strat={strategy_id}  BAG BUY qty={quantity}  "
+             f"stk_ask={entry_px}  opt_bid={bid}  "
+             f"lmt_net_debit={lmt_price:.2f}/share (total ≈ ${lmt_price * 100 * quantity:,.2f})  "
+             f"bag_oid={bag_oid}")
     _log_txn({
         'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
-        'leg': 'stock', 'action': 'BUY', 'symbol': SYMBOL,
-        'local_symbol': SYMBOL, 'sec_type': 'STK', 'quantity': shares,
-        'price': entry_px, 'order_id': stk_oid,
-        'reason': 'composite_signal',
-    })
-
-    cc_oid = app.next_order_id()
-    app.placeOrder(cc_oid, opt, _market_order('SELL', 1))
-    log.info(f"[CC open] pos={pos_id} MKT SELL 1 call strike={strike} exp={exp_ib} "
-             f"bid={bid}  tv={cc_tv:.4f}  cc_oid={cc_oid}")
-    _log_txn({
-        'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
-        'leg': 'option', 'action': 'SELL', 'symbol': SYMBOL,
-        'local_symbol': opt_display, 'sec_type': 'OPT', 'quantity': 1,
-        'price': bid, 'order_id': cc_oid,
-        'reason': f'cc_open_tv_{cc_tv:.4f}',
+        'strategy_id': strategy_id,
+        'leg': 'combo', 'action': 'BUY', 'symbol': SYMBOL,
+        'local_symbol': f'BAG {SYMBOL}+{opt_display}',
+        'sec_type': 'BAG', 'quantity': quantity,
+        'price': lmt_price, 'order_id': bag_oid,
+        'reason': f'composite_signal_strat{strategy_id}_tv{cc_tv:.4f}',
     })
 
     # Persistent option quote subscription for buyback monitoring
@@ -1307,30 +1597,32 @@ def check_entry_signal(
     app._cc_prices[cc_rid] = {'bid': None, 'ask': None}
     app.reqMktData(cc_rid, opt, '', False, False, [])
 
-    last_ext = df_ext.iloc[-1]
     new_row = {
         'position_id':          pos_id,
+        'strategy_id':          strategy_id,
         'entry_time':           bar_dt.isoformat(),
         'entry_price':          entry_px,
         'entry_wap':            float(bar['average']),
         'shares':               shares,
         'cash_used':            cost,
+        'buyback_tv':           float(strat['buyback_tv']),
         'atr_at_entry':         float(last_ext.get('atr_14', float('nan'))),
         'rsi_at_entry':         float(last_ext.get('rsi_14', float('nan'))),
         'adx_at_entry':         float(last_ext.get('adx_14', float('nan'))),
         'vwap_at_entry':        float(last_ext.get('vwp_vwap', float('nan'))),
-        'pending_order_id':     stk_oid,
+        'pending_order_id':     bag_oid,       # entry BAG (atomic)
         'pending_bars':         0,
         'cc_symbol':            SYMBOL,
         'cc_local_symbol':      opt_display,
         'cc_strike':            strike,
         'cc_expiry':            exp_ib,
         'cc_right':             'C',
+        'cc_conid':             option_conid,  # needed to rebuild exit BAG
         'cc_open_price':        bid,
         'cc_open_time':         bar_dt.isoformat(),
         'cc_tv_at_entry':       round(cc_tv, 4),
         'cc_mktdata_req_id':    cc_rid,
-        'cc_pending_order_id':  cc_oid,
+        'cc_pending_order_id':  None,           # set when buyback BAG is submitted
     }
     ps = pd.concat([ps, pd.DataFrame([new_row])], ignore_index=True)
     return ps
@@ -1423,7 +1715,16 @@ def immediate_tv_check(app: IBApp, ps: pd.DataFrame, params: dict,
 
 def main():
     log.info("=" * 72)
-    log.info(f"arbo702 starting up  params={PARAMS}")
+    log.info(f"arbo702 starting up")
+    log.info(f"  symbol={PARAMS['symbol']}  starting_cash=${PARAMS['starting_cash']:,}  "
+             f"clientId={PARAMS['client_id']}")
+    log.info(f"  strategies: {len(PARAMS['strategies'])}")
+    for i, s in enumerate(PARAMS['strategies']):
+        log.info(f"    [{i}] shares={s['shares_per_position']}  "
+                 f"cooldown={s['cooldown_minutes']}m  "
+                 f"cc_tv=[{s['cc_tv_min']},{s['cc_tv_max']}]  "
+                 f"buyback_tv={s['buyback_tv']}  "
+                 f"{s['expiry_label']}/{s['strike_label']}")
     log.info("=" * 72)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)

@@ -66,8 +66,11 @@ logging.basicConfig(
 log = logging.getLogger('combo_order')
 
 # ── parameters for the test ───────────────────────────────────────────────────
+# Standalone params — does NOT depend on paper2/params.json so the test can
+# be run without touching production strategy config.
 TEST_PARAMS = {
-    **arbo.PARAMS,
+    'host':                arbo.PARAMS['host'],
+    'port':                arbo.PARAMS['port'],
     'client_id':           88,       # dedicated for this smoke test
     'shares_per_position': 100,
     'expiry_label':        'w0',
@@ -96,12 +99,18 @@ def wait_for_tick(app: arbo.IBApp, timeout: float = 15.0) -> bool:
     return False
 
 
-def wait_for_order(app: arbo.IBApp, oid: int, timeout: float = 30.0) -> dict:
-    """Poll order_status until terminal or timeout."""
+def wait_for_order(app: arbo.IBApp, oid: int, timeout: float = 30.0,
+                   terminal: tuple = ('Filled', 'Cancelled', 'Inactive', 'ApiCancelled',
+                                      'PreSubmitted', 'Submitted')) -> dict:
+    """
+    Poll order_status until a terminal status is reached or timeout.
+    'PreSubmitted' / 'Submitted' are treated as terminal for this test because
+    pre-market BAGs legitimately park there until the exchange opens.
+    """
     t0 = time.time()
     while time.time() - t0 < timeout:
         st = app.order_status.get(oid, {})
-        if st.get('status') in ('Filled', 'Cancelled', 'Inactive', 'ApiCancelled'):
+        if st.get('status') in terminal:
             return st
         time.sleep(0.25)
     return app.order_status.get(oid, {'status': 'TIMEOUT'})
@@ -299,16 +308,21 @@ def main():
     log.info(f"  BAG oid={bag_oid}  status={status.get('status')}  "
              f"filled={status.get('filled')}  avg={status.get('avg_fill')}")
 
-    if status.get('status') == 'Filled':
-        log.info("  ✔ BAG orders ARE supported in this environment")
+    s = status.get('status', '')
+    if s == 'Filled':
+        log.info("  ✔ BAG orders ARE supported AND filled in this environment")
         log.info(f"  position now:  100 AAPL long  +  1 short call @ {strike} exp {exp_ib}")
         log.info("  close manually in TWS when done")
-    elif status.get('status') in ('Cancelled', 'Inactive', 'ApiCancelled'):
+    elif s in ('PreSubmitted', 'Submitted'):
+        log.info("  ✔ BAG orders ARE supported — order accepted and parked at exchange")
+        log.info("  (PreSubmitted/Submitted is normal pre-market or during IB combo checks)")
+        log.info("  cancel in TWS if you don't want it to fill at market open")
+    elif s in ('Cancelled', 'Inactive', 'ApiCancelled'):
         log.info("  ✖ BAG order was rejected or cancelled — check TWS logs")
         log.info("  common causes: no stock+option combo permission on this account,")
         log.info("  exchange route mismatch, option illiquidity, or insufficient margin")
     else:
-        log.info(f"  ? BAG order status unclear ({status.get('status')}) — inspect TWS")
+        log.info(f"  ? BAG order status unclear ({s}) — inspect TWS")
     log.info("=" * 72)
 
     app.disconnect()

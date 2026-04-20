@@ -33,44 +33,92 @@ The program creates `params.json` on first run with the defaults below.
 
 ## Parameters (`params.json`)
 
+Top-level keys (shared across the whole engine):
+
 | Key | Default | Meaning |
 |---|---|---|
 | `symbol` | `AAPL` | Underlying |
-| `starting_cash` | `500000` | Portfolio cash; limits concurrent positions |
-| `shares_per_position` | `100` | Per-entry share count (multiple of 100) |
-| `cooldown_minutes` | `60` | Gate between **accepted** entries (global) |
-| `cc_tv_min` | `2.5` | Opening time value floor |
-| `cc_tv_max` | `3.6` | Opening time value ceiling |
-| `buyback_tv` | `0.5` | Exit threshold on ask-side TV |
-| `expiry_label` | `w0` | `w0` = this week's Friday, `w1` = next, `w2` = two ahead |
-| `strike_label` | `s-2` | Strike position (`s-2..s+2` relative to chain) |
+| `starting_cash` | `500000` | Shared cash pool for all strategies |
+| `strategies` | `[{…}]` | Array of strategy configs (see below) |
 | `host` | `127.0.0.1` | TWS host |
 | `port` | `7497` | TWS paper-trading port |
-| `client_id` | `2` | IB clientId (paper1 uses 1, test uses 99) |
+| `client_id` | `2` | IB clientId |
 | `retention_days` | `30` | `data/ref/*.csv` older than this get pruned at startup |
+
+Each element of `strategies[]`:
+
+| Key | Meaning |
+|---|---|
+| `shares_per_position` | Share count for *this* strategy's entries (multiple of 100) |
+| `cooldown_minutes` | Minimum minutes between accepted entries **for this strategy** |
+| `cc_tv_min` / `cc_tv_max` | Opening-TV gate specific to this strategy |
+| `buyback_tv` | Exit threshold; copied to each position row at entry |
+| `expiry_label` | `w0` / `w1` / `w2` |
+| `strike_label` | `s-2` … `s+2` |
+
+Example — 3 strategies running concurrently:
+```json
+{
+  "symbol":        "AAPL",
+  "starting_cash": 500000,
+  "strategies": [
+    {"shares_per_position": 200, "cooldown_minutes": 15,
+     "cc_tv_min": 2.5, "cc_tv_max": 3.5, "buyback_tv": 0.5,
+     "expiry_label": "w0", "strike_label": "s-2"},
+    {"shares_per_position": 100, "cooldown_minutes": 60,
+     "cc_tv_min": 2.5, "cc_tv_max": 3.5, "buyback_tv": 0.5,
+     "expiry_label": "w0", "strike_label": "s+2"},
+    {"shares_per_position": 100, "cooldown_minutes": 60,
+     "cc_tv_min": 2.5, "cc_tv_max": 3.5, "buyback_tv": 0.1,
+     "expiry_label": "w0", "strike_label": "s-1"}
+  ],
+  "host": "127.0.0.1", "port": 7497, "client_id": 2, "retention_days": 30
+}
+```
+
+Legacy flat `params.json` (one strategy inlined at top level) is auto-wrapped
+into `strategies: [ { … } ]` at load time.
 
 ## Entry rule
 
-Evaluated on every completed 1-min bar (before 15:45):
-1. `(any bsig_trend) AND (any bsig_momentum)` on the latest extended row
-2. `bar_dt − last_entry_time ≥ cooldown_minutes`
-3. `cash_on_hand ≥ shares × avg_ask`
-4. Option at `(expiry_label, strike_label)` has a live bid
-5. `cc_tv = option_bid − max(0, avg_ask − strike)` is in `[cc_tv_min, cc_tv_max]`
+On every completed 1-min bar (before 15:45):
 
-On pass: submits sequential MKT orders — BUY stock, SELL 1 call — and
-subscribes persistent `reqMktData` on the call for buyback monitoring.
+1. Evaluate the composite signal once: `(any bsig_trend) AND (any bsig_momentum)`
+2. If it fired, walk every strategy in `strategies[]` and independently check:
+   - `bar_dt − last_entry_time_for_strategy_i ≥ strategy_i.cooldown_minutes`
+   - `cash_on_hand ≥ strategy_i.shares_per_position × avg_ask`
+   - Option at `(strategy_i.expiry_label, strategy_i.strike_label)` has a live bid
+   - `cc_tv` is in `[strategy_i.cc_tv_min, strategy_i.cc_tv_max]`
+3. For each strategy that passes: submit a **single atomic BAG LMT order**
+   (BUY stock + SELL 1 call as one exchange-side combo unit).  LMT =
+   `stock_ask − option_bid + BAG_LMT_ENTRY_BUFFER` per share.  Subscribe
+   persistent `reqMktData` on the call for buyback monitoring.  BAG
+   guarantees atomic fill — no naked stock possible.
+
+Multiple strategies can open on the same bar.  Cash is a shared pool — if
+strategy 0 consumes the available cash, later strategies get skipped with a
+`log-and-skip`.
 
 ## Exit rule
 
 **Buyback (each bar, per open CC):**
-`ask − max(0, stock_bid − strike) < buyback_tv` → MKT BUY call + MKT SELL stock.
+`ask − max(0, stock_bid − strike) < buyback_tv` → submit a **single atomic
+BAG LMT order** (SELL combo = BUY call + SELL stock).  LMT =
+`stock_bid − option_ask − BAG_LMT_EXIT_BUFFER` per share.  Row stays in
+`position_support.csv` (pending exit state) until the BAG fills; then the
+row is dropped.  `cancel_stale_orders()` re-issues after 5 bars if the exit
+LMT hasn't filled.
 
 **Expiry (Friday ≥ 15:45):**
 - `stock_bid > strike` → IB auto-assigns (stock sold at strike)
 - `stock_bid ≤ strike` → MKT SELL stock
 
 No stop loss, no profit target.  CCs run to expiry otherwise.
+
+**Atomicity guarantee:** every stock+call pair is opened and closed as a
+single BAG combo order — no intermediate "stock only" or "call only" state.
+If a BAG is rejected or doesn't fill, the position simply doesn't open (on
+entry) or stays open (on exit) and is retried next bar.
 
 ## Restart idempotency
 
