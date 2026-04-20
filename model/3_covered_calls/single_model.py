@@ -18,7 +18,8 @@ Strategy:
     s-2 = floor(entry_price) - 2
 
 Exit (per variant):
-  1. Option ask < $0.50   → buyback — buy back call, sell stock at avg_bid
+  1. option_ask − max(0, avg_bid − strike) < BUYBACK_TV → buyback
+     — time-value-based: the cost to close, net of intrinsic, has fallen below threshold
   2. Expiry Friday ≥ 15:00:
        stock avg_bid > strike (ITM) → assigned — stock sold at strike
        stock avg_bid ≤ strike (OTM) → expired_otm — stock sold at avg_bid
@@ -658,11 +659,11 @@ def _log_trade_table(
     evals:           list,
 ):
     """Write a trade to the log in ASCII table format."""
-    t   = indicators['trend'].upper()
-    m   = indicators['momentum'].upper()
-    v   = indicators['volatility'].upper()
-    vol = indicators['volume'].upper()
-    combo_str    = f"{t}+{m}+{v}+{vol}"
+    t   = indicators.get('trend', '').upper()
+    m   = indicators.get('momentum', '').upper()
+    v   = indicators.get('volatility', '').upper()
+    vol = indicators.get('volume', '').upper()
+    combo_str    = '+'.join(x for x in (t, m, v, vol) if x)
     entry_time   = entry_snapshot['entry_time']
     entry_price  = entry_snapshot['entry_price']
     shares       = entry_snapshot['shares']
@@ -1112,6 +1113,7 @@ def run_combo(
                     'strike':       strike,
                     'expiry_date':  str(expiry_date) if expiry_date else None,
                     'cc_open_price': open_price,
+                    'cc_tv_at_entry': cc_tv_entry,
                     'exit_time':    exit_time,
                     'exit_price':   cc_close_price,
                     'exit_reason':  exit_reason,
@@ -1232,8 +1234,16 @@ def parse_args():
         help='Calendar days per test window (default: 14)',
     )
     parser.add_argument(
-        '--buyback', type=float, default=0.50,
-        help='Option ask threshold to trigger a buyback exit (default: 0.50)',
+        '--cc_tv_min', type=float, default=1.00,
+        help='Minimum opening time value to open a position (default: 1.00)',
+    )
+    parser.add_argument(
+        '--cc_tv_max', type=float, default=3.00,
+        help='Maximum opening time value to open a position (default: 3.00)',
+    )
+    parser.add_argument(
+        '--buyback_tv', type=float, default=0.25,
+        help='Buyback threshold on the ask-side time value (default: 0.25)',
     )
     parser.add_argument(
         '--expiry-label', nargs='+', default=None,
@@ -1247,8 +1257,10 @@ def parse_args():
     )
     args = parser.parse_args()
 
-    global OPTION_EXIT_PRICE, OPTION_VARIANTS
-    OPTION_EXIT_PRICE = args.buyback
+    global BUYBACK_TV, CC_TV_MIN, CC_TV_MAX, OPTION_VARIANTS
+    BUYBACK_TV = args.buyback_tv
+    CC_TV_MIN  = args.cc_tv_min
+    CC_TV_MAX  = args.cc_tv_max
 
     expiry_filter = args.expiry_label or EXPIRY_WEEKS
     strike_filter = args.strike_label or STRIKE_LABELS
@@ -1342,7 +1354,8 @@ def write_single_report(
     lines.append(f'| Sample bars/window | {N_SAMPLE:,} |')
     lines.append(f'| Shares per trade   | {SHARES} |')
     lines.append(f'| Commission         | ${COMMISSION:.2f} per round-trip |')
-    lines.append(f'| Buyback threshold  | ${OPTION_EXIT_PRICE:.2f} |')
+    lines.append(f'| cc_tv range        | ${CC_TV_MIN:.2f} – ${CC_TV_MAX:.2f} |')
+    lines.append(f'| Buyback tv         | ${BUYBACK_TV:.2f} |')
     lines.append(f'| Output directory   | `{run_dir.name}` |')
     lines.append('')
 
