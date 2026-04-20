@@ -1,0 +1,1482 @@
+"""
+arbo702.py — AAPL signal-driven covered-call paper trader.
+
+Entry rule (per completed 1-min bar, while market is open):
+  composite = (any bsig_trend) AND (any bsig_momentum)
+  and  cooldown_minutes since last accepted entry has elapsed
+  and  cash on hand >= shares × entry_price
+  and  the chosen (expiry_label, strike_label) option has
+       cc_tv = option_bid − max(0, entry_stock − strike) in [cc_tv_min, cc_tv_max]
+
+On entry fire, submit sequentially:
+   1.  MKT BUY  shares_per_position AAPL
+   2.  MKT SELL 1 call (cc contract)
+
+Exit rule (per open position, every bar):
+  if option_ask − max(0, stock_bid − strike) < buyback_tv:
+      MKT BUY  1 call (buy-to-close)
+      MKT SELL shares_per_position AAPL
+  CCs otherwise run to IB's auto-expiry handling (assigned or expired OTM).
+  On startup, for every open CC, TV is re-checked immediately; closes if below.
+
+External dependencies
+─────────────────────
+  - IB TWS / Gateway (paper port 7497) with API enabled, trusted IP 127.0.0.1,
+    clientId open for this program (default 2)
+  - Python: ibapi, pandas, numpy
+  - ../2_indicator/1_compute_indicators.py      → compute_indicators(df)
+  - ../model/1a_tech_indicators_sock_trade/signals.py → add_buy_signals(df)
+
+Files created by this program
+  paper2/params.json                                    parameters (this file)
+  paper2/data/ref/contracts_{yymmdd}.csv                option chain (once/day)
+  paper2/data/ref/stock_{yymmdd}.csv                    yesterday's 1-min bars
+  paper2/data/ref/stock_{yymmdd}_partial.csv            today's rolling 1-min bars
+  paper2/data/position_support.csv                      live position state
+  paper2/data/transaction.csv                           append-only trade log
+  paper2/logs/arbo702_{ops,market,trade}.log            hourly-rotating logs
+
+Restart idempotency
+───────────────────
+On startup: reqPositions → ground truth; flatten orphan IB positions with MKT
+SELL; drop orphan CSV rows.  For each surviving open CC, resubscribe
+reqMktData and immediately compute TV — if below buyback_tv, close now.
+"""
+
+from __future__ import annotations
+
+import csv
+import importlib.util
+import json
+import logging
+import math
+import queue
+import sys
+import threading
+import time
+from datetime import datetime, date, timedelta
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from ibapi.client import EClient
+from ibapi.contract import Contract
+from ibapi.order import Order
+from ibapi.wrapper import EWrapper
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PATHS & EXTERNAL IMPORTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_HERE    = Path(__file__).parent
+_BASE    = _HERE.parent
+_INDIC   = _BASE / '2_indicator'
+_MODEL1A = _BASE / 'model' / '1a_tech_indicators_sock_trade'
+sys.path.insert(0, str(_MODEL1A))
+
+_spec = importlib.util.spec_from_file_location(
+    'compute_indicators_mod', _INDIC / '1_compute_indicators.py'
+)
+_cmod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_cmod)
+compute_indicators = _cmod.compute_indicators
+
+from signals import add_buy_signals  # noqa: E402
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARAMS
+# ══════════════════════════════════════════════════════════════════════════════
+
+PARAMS_FILE = _HERE / 'params.json'
+
+_DEFAULT_PARAMS = {
+    'symbol':              'AAPL',
+    'starting_cash':       500_000,
+    'shares_per_position': 100,
+    'cooldown_minutes':    60,
+    'cc_tv_min':           2.5,
+    'cc_tv_max':           3.6,
+    'buyback_tv':          0.5,
+    'expiry_label':        'w0',
+    'strike_label':        's-2',
+    'host':                '127.0.0.1',
+    'port':                7497,
+    'client_id':           2,
+    'retention_days':      30,
+}
+
+
+def load_params() -> dict:
+    if not PARAMS_FILE.exists():
+        PARAMS_FILE.write_text(json.dumps(_DEFAULT_PARAMS, indent=2))
+    p = json.loads(PARAMS_FILE.read_text())
+    # Fill missing keys with defaults
+    for k, v in _DEFAULT_PARAMS.items():
+        p.setdefault(k, v)
+    # Validate shares is a multiple of 100
+    shares = int(p['shares_per_position'])
+    if shares % 100 != 0 or shares <= 0:
+        raise ValueError(f"shares_per_position must be positive multiple of 100: {shares}")
+    p['shares_per_position'] = shares
+    return p
+
+
+PARAMS = load_params()
+SYMBOL = PARAMS['symbol']
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Buy-signal buckets (union composite: any-trend AND any-momentum)
+TREND    = ['ema', 'macd', 'adx', 'sar', 'don', 'arn', 'vtx']
+MOMENTUM = ['rsi', 'sto', 'cci', 'cmo', 'tsi', 'roc', 'frc', 'srsi', 'rmi', 'macd']
+BSIG_TREND_COLS    = [f'bsig_{k}' for k in TREND]
+BSIG_MOMENTUM_COLS = [f'bsig_{k}' for k in MOMENTUM]
+
+COMMISSION        = 2.00
+CONN_TIMEOUT      = 20
+OPT_QUOTE_TIMEOUT = 5
+MAX_BARS          = 1000        # rolling bar history kept in today-partial file
+EOD_MINUTE        = 15 * 60 + 45  # 15:45
+REQ_STK_MKTDATA   = 2
+REQ_VIX_MKTDATA   = 3
+REQ_STK_RTBARS    = 4
+REQ_HIST          = 5
+_DYN_REQ_START    = 100
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FILE PATHS
+# ══════════════════════════════════════════════════════════════════════════════
+
+DATA_DIR        = _HERE / 'data'
+REF_DIR         = DATA_DIR / 'ref'
+LOGS_DIR        = _HERE / 'logs'
+POS_SUPPORT_CSV = DATA_DIR / 'position_support.csv'
+TRANSACTION_CSV = DATA_DIR / 'transaction.csv'
+
+
+def _yymmdd(d: date) -> str:
+    return d.strftime('%y%m%d')
+
+
+def contracts_file(d: date) -> Path:
+    return REF_DIR / f'contracts_{_yymmdd(d)}.csv'
+
+
+def stock_file(d: date, partial: bool = False) -> Path:
+    stem = f'stock_{_yymmdd(d)}' + ('_partial' if partial else '')
+    return REF_DIR / f'{stem}.csv'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _setup_logging() -> logging.Logger:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    fmt = logging.Formatter('%(asctime)s  %(levelname)-7s  %(message)s',
+                            datefmt='%H:%M:%S')
+
+    trade_prefixes = ('[BUY]', '[fill]', '[orders]', '[CC open]', '[CC buyback]',
+                      '[CC expiry]', '[EOD]', '[txn]', '[exit]')
+    market_prefixes = ('[tick]', '[bar]', '[cc monitor]')
+
+    class _Pref(logging.Filter):
+        def __init__(self, pfx, include):
+            super().__init__()
+            self.pfx, self.include = pfx, include
+        def filter(self, r):
+            msg = r.getMessage()
+            m = any(msg.startswith(p) for p in self.pfx)
+            return m if self.include else not m
+
+    def _h(name: str, level: int) -> TimedRotatingFileHandler:
+        h = TimedRotatingFileHandler(
+            LOGS_DIR / name, when='H', interval=1, backupCount=24 * 14,
+            encoding='utf-8',
+        )
+        h.suffix = '%Y%m%d_%H'
+        h.setLevel(level)
+        h.setFormatter(fmt)
+        return h
+
+    ops = _h('arbo702_ops.log', logging.INFO)
+    ops.addFilter(_Pref(trade_prefixes + market_prefixes, include=False))
+
+    mkt = _h('arbo702_market.log', logging.DEBUG)
+    mkt.addFilter(_Pref(market_prefixes, include=True))
+
+    tr = _h('arbo702_trade.log', logging.INFO)
+    tr.addFilter(_Pref(trade_prefixes, include=True))
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    ch.addFilter(_Pref(market_prefixes, include=False))
+
+    lg = logging.getLogger('arbo702')
+    lg.setLevel(logging.DEBUG)
+    if not lg.handlers:
+        for handler in (ops, mkt, tr, ch):
+            lg.addHandler(handler)
+    return lg
+
+
+log: logging.Logger = _setup_logging()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IB APP (EWrapper + EClient)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IBApp(EWrapper, EClient):
+    """
+    Single IB connection; runs in a daemon thread.  Main thread pulls
+    completed 1-min bars from bar_queue.
+    """
+
+    def __init__(self):
+        EClient.__init__(self, self)
+        self._connected_event = threading.Event()
+        self._next_order_id   = 1000
+        self._oid_lock        = threading.Lock()
+        self._dyn_req         = _DYN_REQ_START
+        self._req_lock        = threading.Lock()
+
+        # 5-sec rtbar accumulator → 1-min bar queue
+        self._rtbar_acc: dict = {}
+        self._bar_lock        = threading.Lock()
+        self.bar_queue: queue.Queue = queue.Queue()
+
+        # Live tick state
+        self._current_bid: float | None = None
+        self._current_ask: float | None = None
+        self._current_vix: float | None = None
+
+        # Positions
+        self._positions: list[dict] = []
+        self._pos_done = threading.Event()
+
+        # Order status (orderId → {status, filled, avg_fill})
+        self.order_status: dict[int, dict] = {}
+
+        # Option single-shot quote collection (used by get_option_quote)
+        self._opt_bid : dict[int, float] = {}
+        self._opt_ask : dict[int, float] = {}
+        self._opt_done: dict[int, threading.Event] = {}
+
+        # Persistent CC option subscriptions keyed by reqId
+        self._cc_prices: dict[int, dict] = {}
+
+        # Contract details collection (reqContractDetails)
+        self._cd_rows : dict[int, list[dict]] = {}
+        self._cd_done : dict[int, threading.Event] = {}
+
+        # Historical data collection (reqHistoricalData)
+        self._hist_rows: dict[int, list[dict]] = {}
+        self._hist_done: dict[int, threading.Event] = {}
+        self._hist_err : dict[int, str] = {}
+
+    # ── connection ────────────────────────────────────────────────────────────
+    def nextValidId(self, orderId: int):
+        with self._oid_lock:
+            self._next_order_id = orderId
+        self._connected_event.set()
+        log.info(f"[IB] Connected — next order ID: {orderId}")
+
+    def error(self, reqId: int, errorCode: int, errorString: str,
+              advancedOrderRejectJson: str = ''):
+        if reqId == -1:
+            if errorCode not in (2104, 2106, 2158):
+                log.info(f"[IB] info {errorCode}: {errorString}")
+            return
+        # Warnings (code ≥ 2000) are not failures — they arrive on arbitrary
+        # reqIds and must NOT trip the historical / option / contract-details
+        # fall-back paths.
+        if errorCode >= 2000:
+            log.debug(f"[IB] warning reqId={reqId} {errorCode}: {errorString}")
+            return
+        log.error(f"[IB] error reqId={reqId} code={errorCode}: {errorString}")
+        # Real errors: unblock any waiting synchronous callers with err msg
+        if reqId in self._hist_done:
+            self._hist_err[reqId] = f"{errorCode}:{errorString}"
+            self._hist_done[reqId].set()
+        if reqId in self._opt_done:
+            self._opt_done[reqId].set()
+        if reqId in self._cd_done:
+            self._cd_done[reqId].set()
+
+    # ── id helpers ────────────────────────────────────────────────────────────
+    def next_req_id(self) -> int:
+        with self._req_lock:
+            rid = self._dyn_req
+            self._dyn_req += 1
+            return rid
+
+    def next_order_id(self) -> int:
+        with self._oid_lock:
+            oid = self._next_order_id
+            self._next_order_id += 1
+            return oid
+
+    # ── 5-sec rtbars → 1-min queue ────────────────────────────────────────────
+    def realtimeBar(self, reqId: int, time_: int, open_: float, high: float,
+                    low: float, close: float, volume: int, wap: float, count: int):
+        if reqId != REQ_STK_RTBARS:
+            return
+        minute_ts = (time_ // 60) * 60
+        with self._bar_lock:
+            acc = self._rtbar_acc
+            if not acc:
+                log.info(f"[bar] RealTimeBars first update minute_ts={minute_ts}")
+            elif acc['minute_ts'] != minute_ts:
+                vol = acc['volume']
+                avg = acc['sum_wap_vol'] / vol if vol > 0 else acc['close']
+                bid = self._current_bid if self._current_bid else avg
+                ask = self._current_ask if self._current_ask else avg
+                vix = self._current_vix if self._current_vix else float('nan')
+                dt_str = datetime.fromtimestamp(acc['minute_ts']).strftime('%Y-%m-%d %H:%M:%S')
+                row = {
+                    'date':        dt_str,
+                    'vix':         round(float(vix), 4) if not math.isnan(vix) else None,
+                    'open':        acc['open'],
+                    'high':        acc['high'],
+                    'low':         acc['low'],
+                    'close':       acc['close'],
+                    'avg_bid':     round(float(bid), 4),
+                    'avg_ask':     round(float(ask), 4),
+                    'max_ask':     round(float(ask), 4),
+                    'min_bid':     round(float(bid), 4),
+                    'average':     round(float(avg), 4),
+                    'barCount':    acc['count'],
+                    'volume':      acc['volume'],
+                    'symbol':      SYMBOL,
+                    'localSymbol': SYMBOL,
+                    'conId':       '',
+                }
+                self.bar_queue.put(row)
+                log.info(f"[bar] queued {dt_str}  close={row['close']}  wap={row['average']}  "
+                         f"bid={row['avg_bid']}  ask={row['avg_ask']}  vix={row['vix']}")
+                self._rtbar_acc = {}
+                acc = {}
+            if not acc:
+                self._rtbar_acc = {
+                    'minute_ts':   minute_ts,
+                    'open':        open_,
+                    'high':        high,
+                    'low':         low,
+                    'close':       close,
+                    'volume':      volume,
+                    'sum_wap_vol': wap * volume,
+                    'count':       count,
+                }
+            else:
+                self._rtbar_acc['high']        = max(acc['high'], high)
+                self._rtbar_acc['low']         = min(acc['low'],  low)
+                self._rtbar_acc['close']       = close
+                self._rtbar_acc['volume']      += volume
+                self._rtbar_acc['sum_wap_vol'] += wap * volume
+                self._rtbar_acc['count']       += count
+
+    # ── tick prices ───────────────────────────────────────────────────────────
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib):
+        if price <= 0:
+            return
+        if reqId == REQ_STK_MKTDATA:
+            if tickType in (1, 66):
+                self._current_bid = price
+                log.debug(f"[tick] {SYMBOL} bid={price}")
+            elif tickType in (2, 67):
+                self._current_ask = price
+                log.debug(f"[tick] {SYMBOL} ask={price}")
+        elif reqId == REQ_VIX_MKTDATA:
+            if tickType in (4, 9, 68):
+                self._current_vix = price
+                log.debug(f"[tick] VIX={price}")
+        elif reqId in self._cc_prices:
+            if tickType in (1, 66):
+                self._cc_prices[reqId]['bid'] = price
+            elif tickType in (2, 67):
+                self._cc_prices[reqId]['ask'] = price
+        elif reqId in self._opt_done:
+            if tickType in (1, 66):
+                self._opt_bid[reqId] = price
+            elif tickType in (2, 67):
+                self._opt_ask[reqId] = price
+            if reqId in self._opt_bid and reqId in self._opt_ask:
+                self._opt_done[reqId].set()
+
+    def tickSize(self, reqId, tickType, size): pass
+
+    # ── positions ─────────────────────────────────────────────────────────────
+    def position(self, account, contract, position, avgCost):
+        self._positions.append({
+            'account':     account,
+            'symbol':      contract.symbol,
+            'localSymbol': contract.localSymbol,
+            'conId':       contract.conId,
+            'secType':     contract.secType,
+            'position':    position,
+            'avgCost':     avgCost,
+            'strike':      getattr(contract, 'strike', 0) or 0,
+            'right':       getattr(contract, 'right', '') or '',
+            'expiry':      getattr(contract, 'lastTradeDateOrContractMonth', '') or '',
+        })
+
+    def positionEnd(self):
+        self._pos_done.set()
+
+    # ── order status ──────────────────────────────────────────────────────────
+    def orderStatus(self, orderId: int, status: str, filled: float,
+                    remaining: float, avgFillPrice: float, permId: int,
+                    parentId: int, lastFillPrice: float, clientId: int,
+                    whyHeld: str, mktCapPrice: float):
+        self.order_status[orderId] = {
+            'status': status, 'filled': filled, 'avg_fill': avgFillPrice,
+        }
+        log.info(f"[order] id={orderId}  status={status}  filled={filled}  avg={avgFillPrice:.4f}")
+
+    # ── contract details ──────────────────────────────────────────────────────
+    def contractDetails(self, reqId: int, contractDetails):
+        c = contractDetails.contract
+        self._cd_rows.setdefault(reqId, []).append({
+            'symbol':       c.symbol,
+            'secType':      c.secType,
+            'expiry':       c.lastTradeDateOrContractMonth,
+            'strike':       float(c.strike) if c.strike else 0.0,
+            'right':        c.right,
+            'exchange':     c.exchange,
+            'currency':     c.currency,
+            'localSymbol':  c.localSymbol,
+            'multiplier':   c.multiplier,
+            'conId':        c.conId,
+        })
+
+    def contractDetailsEnd(self, reqId: int):
+        if reqId in self._cd_done:
+            self._cd_done[reqId].set()
+
+    # ── historical data ───────────────────────────────────────────────────────
+    def historicalData(self, reqId: int, bar):
+        self._hist_rows.setdefault(reqId, []).append({
+            'date':   bar.date,
+            'open':   bar.open,
+            'high':   bar.high,
+            'low':    bar.low,
+            'close':  bar.close,
+            'volume': bar.volume,
+            'wap':    getattr(bar, 'wap', bar.close),
+            'barCount': getattr(bar, 'barCount', 0),
+        })
+
+    def historicalDataEnd(self, reqId: int, start: str, end: str):
+        if reqId in self._hist_done:
+            self._hist_done[reqId].set()
+
+    # ── synchronous RPC helpers ───────────────────────────────────────────────
+    def fetch_positions(self, timeout: float = 15.0) -> list[dict]:
+        self._positions = []
+        self._pos_done.clear()
+        self.reqPositions()
+        if not self._pos_done.wait(timeout=timeout):
+            log.warning("[IB] Timed out waiting for positions")
+        return list(self._positions)
+
+    def get_option_quote(self, contract: Contract,
+                         timeout: float = OPT_QUOTE_TIMEOUT) -> tuple[float | None, float | None]:
+        """
+        One-shot option quote.  Uses snapshot=True so IB returns the last-known
+        quote (even if stale / outside market hours) and auto-unsubscribes.
+        The waiter fires when BOTH bid and ask are present; after a partial
+        wait (half the timeout) it settles for whichever side(s) arrived.
+        """
+        rid = self.next_req_id()
+        evt = threading.Event()
+        self._opt_done[rid] = evt
+        self._opt_bid.pop(rid, None)
+        self._opt_ask.pop(rid, None)
+        # snapshot=True returns the cached last quote and unsubscribes on its own
+        self.reqMktData(rid, contract, '', True, False, [])
+        got_both = evt.wait(timeout=timeout)
+        if not got_both:
+            # Give a partial answer if at least one side came in
+            time.sleep(0.3)
+        try:
+            self.cancelMktData(rid)
+        except Exception:
+            pass
+        bid = self._opt_bid.pop(rid, None)
+        ask = self._opt_ask.pop(rid, None)
+        self._opt_done.pop(rid, None)
+        if bid or ask:
+            log.info(f"[opt quote] {contract.localSymbol or contract.symbol}  "
+                     f"bid={bid}  ask={ask}  "
+                     f"({'both' if (bid and ask) else 'partial'})")
+        else:
+            log.info(f"[opt quote] {contract.localSymbol or contract.symbol}  no quote")
+        return bid, ask
+
+    def fetch_option_chain(self, symbol: str,
+                           timeout: float = 30.0) -> list[dict]:
+        """
+        reqContractDetails with right='C' and no strike/expiry — returns every
+        listed call on the symbol.  Used to build contracts_{yymmdd}.csv.
+        """
+        c = Contract()
+        c.symbol     = symbol
+        c.secType    = 'OPT'
+        c.exchange   = 'SMART'
+        c.currency   = 'USD'
+        c.right      = 'C'
+        c.multiplier = '100'
+        rid = self.next_req_id()
+        self._cd_rows[rid]  = []
+        self._cd_done[rid]  = threading.Event()
+        self.reqContractDetails(rid, c)
+        if not self._cd_done[rid].wait(timeout=timeout):
+            log.warning(f"[chain] Timed out waiting for contract details rid={rid}")
+        rows = self._cd_rows.pop(rid, [])
+        self._cd_done.pop(rid, None)
+        return rows
+
+    def fetch_historical_minute_bars(self, contract: Contract, end_dt: datetime,
+                                     duration: str, timeout: float = 30.0
+                                     ) -> tuple[list[dict], str | None]:
+        """
+        reqHistoricalData for 1-minute TRADES bars.  Returns (rows, err_msg).
+        end_dt in local time; IB takes 'YYYYMMDD HH:MM:SS' format.
+        """
+        rid = self.next_req_id()
+        self._hist_rows[rid] = []
+        self._hist_done[rid] = threading.Event()
+        self._hist_err.pop(rid, None)
+        end_str = end_dt.strftime('%Y%m%d %H:%M:%S US/Eastern')
+        self.reqHistoricalData(
+            rid, contract, end_str, duration, '1 min', 'TRADES',
+            1, 1, False, [],
+        )
+        got = self._hist_done[rid].wait(timeout=timeout)
+        rows = self._hist_rows.pop(rid, [])
+        err  = self._hist_err.pop(rid, None)
+        self._hist_done.pop(rid, None)
+        if not got:
+            err = err or 'timeout'
+        return rows, err
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTRACT / ORDER HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _stk_contract() -> Contract:
+    c = Contract()
+    c.symbol      = SYMBOL
+    c.secType     = 'STK'
+    c.exchange    = 'SMART'
+    c.primaryExch = 'NASDAQ'
+    c.currency    = 'USD'
+    return c
+
+
+def _vix_contract() -> Contract:
+    c = Contract()
+    c.symbol   = 'VIX'
+    c.secType  = 'IND'
+    c.exchange = 'CBOE'
+    c.currency = 'USD'
+    return c
+
+
+def _option_contract(strike: float, expiry_ib: str, right: str = 'C') -> Contract:
+    c = Contract()
+    c.symbol     = SYMBOL
+    c.secType    = 'OPT'
+    c.exchange   = 'SMART'
+    c.currency   = 'USD'
+    c.lastTradeDateOrContractMonth = expiry_ib
+    c.right      = right
+    c.strike     = strike
+    c.multiplier = '100'
+    return c
+
+
+def _market_order(action: str, qty: int) -> Order:
+    o = Order()
+    o.action        = action
+    o.orderType     = 'MKT'
+    o.totalQuantity = qty
+    o.tif           = 'DAY'
+    o.eTradeOnly    = False
+    o.firmQuoteOnly = False
+    return o
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPIRY / STRIKE RESOLUTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def resolve_expiry_friday(entry_date: date, expiry_label: str) -> date:
+    """w0/w1/w2 → Friday of the entry week + N weeks ahead."""
+    if not expiry_label.startswith('w') or not expiry_label[1:].isdigit():
+        raise ValueError(f"Invalid expiry_label: {expiry_label}")
+    weeks_ahead = int(expiry_label[1:])
+    # Monday=0 … Friday=4
+    days_to_fri = (4 - entry_date.weekday()) % 7
+    # If today is already Friday, w0 is today
+    if entry_date.weekday() == 4:
+        base_fri = entry_date
+    else:
+        base_fri = entry_date + timedelta(days=days_to_fri)
+    return base_fri + timedelta(weeks=weeks_ahead)
+
+
+def resolve_strike(chain_df: pd.DataFrame, expiry_ib: str,
+                   entry_price: float, strike_label: str) -> float | None:
+    """
+    Walk the option chain for the given expiry and return the strike that
+    corresponds to the requested position label (s-2 … s+2).
+    """
+    if len(strike_label) < 3 or strike_label[:2] not in ('s-', 's+'):
+        raise ValueError(f"Invalid strike_label: {strike_label}")
+    direction = strike_label[1]
+    step      = int(strike_label[2:])
+
+    sub = chain_df[chain_df['expiry'] == expiry_ib]
+    strikes = sorted(set(float(s) for s in sub['strike'].tolist() if s > 0))
+    if direction == '-':
+        cands = sorted([s for s in strikes if s < entry_price], reverse=True)
+    else:
+        cands = sorted([s for s in strikes if s > entry_price])
+    return float(cands[step]) if len(cands) > step else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REFERENCE DATA — contracts + stock history
+# ══════════════════════════════════════════════════════════════════════════════
+
+_chain_cache: tuple[date, pd.DataFrame] | None = None
+
+
+def ensure_contracts(app: IBApp, today: date) -> pd.DataFrame:
+    """
+    Return the option chain for SYMBOL as of `today`.  Loads from the
+    date-stamped cache file if present, else queries IB and persists.
+    Called once per day.
+    """
+    global _chain_cache
+    if _chain_cache and _chain_cache[0] == today:
+        return _chain_cache[1]
+
+    REF_DIR.mkdir(parents=True, exist_ok=True)
+    path = contracts_file(today)
+    if path.exists():
+        df = pd.read_csv(path, dtype={'expiry': str, 'conId': 'Int64'})
+        log.info(f"[chain] loaded {len(df):,} rows from {path.name}")
+    else:
+        log.info(f"[chain] {path.name} missing — reqContractDetails for {SYMBOL} calls")
+        rows = app.fetch_option_chain(SYMBOL)
+        if not rows:
+            raise RuntimeError(f"reqContractDetails returned 0 rows for {SYMBOL}")
+        df = pd.DataFrame(rows)
+        df.to_csv(path, index=False)
+        log.info(f"[chain] wrote {len(df):,} rows → {path.name}")
+    _chain_cache = (today, df)
+    return df
+
+
+def ensure_stock_history(app: IBApp, today: date) -> pd.DataFrame:
+    """
+    Return a DataFrame of 1-minute bars covering up through ~now.  Combines:
+      - yesterday's  full stock_{yymmdd}.csv (from cache or HMDS)
+      - today's partial stock_{yymmdd}_partial.csv (if exists)
+      - if partial is empty/stale, try HMDS for today-so-far; on error, return what we have
+    """
+    REF_DIR.mkdir(parents=True, exist_ok=True)
+    frames: list[pd.DataFrame] = []
+
+    # Yesterday
+    y = today - timedelta(days=1)
+    # Step back to previous trading day (skip weekends)
+    while y.weekday() > 4:
+        y -= timedelta(days=1)
+    y_path = stock_file(y)
+    if y_path.exists():
+        df_y = pd.read_csv(y_path, parse_dates=['date'], low_memory=False)
+        frames.append(df_y)
+        log.info(f"[history] yesterday from cache: {len(df_y):,} rows  {y_path.name}")
+    else:
+        log.info(f"[history] yesterday cache missing — trying HMDS for {y}")
+        # 1 trading day ending at tomorrow-midnight of yesterday
+        end = datetime.combine(y + timedelta(days=1), datetime.min.time())
+        rows, err = app.fetch_historical_minute_bars(
+            _stk_contract(), end, '1 D', timeout=30.0,
+        )
+        if err:
+            log.warning(f"[history] HMDS yesterday failed: {err} — continuing without")
+        elif rows:
+            df_y = _hist_rows_to_df(rows)
+            df_y.to_csv(y_path, index=False)
+            frames.append(df_y)
+            log.info(f"[history] yesterday from HMDS: {len(df_y):,} rows saved → {y_path.name}")
+
+    # Today partial
+    t_partial = stock_file(today, partial=True)
+    if t_partial.exists():
+        df_t = pd.read_csv(t_partial, parse_dates=['date'], low_memory=False)
+        frames.append(df_t)
+        log.info(f"[history] today partial: {len(df_t):,} rows  {t_partial.name}")
+    else:
+        # Attempt to bootstrap today's morning bars via HMDS
+        now = datetime.now()
+        if now.time() > datetime.min.time().replace(hour=9, minute=30):
+            log.info(f"[history] today partial missing — trying HMDS for today-so-far")
+            rows, err = app.fetch_historical_minute_bars(
+                _stk_contract(), now, '1 D', timeout=30.0,
+            )
+            if err:
+                log.warning(f"[history] HMDS today failed: {err} — realtime warmup only")
+            elif rows:
+                df_t = _hist_rows_to_df(rows)
+                df_t = df_t[df_t['date'].dt.date == today].copy()
+                df_t.to_csv(t_partial, index=False)
+                frames.append(df_t)
+                log.info(f"[history] today from HMDS: {len(df_t):,} rows → {t_partial.name}")
+
+    if frames:
+        df = (pd.concat(frames, ignore_index=True)
+                .drop_duplicates(subset='date')
+                .sort_values('date')
+                .reset_index(drop=True))
+    else:
+        df = pd.DataFrame(columns=[
+            'date', 'vix', 'open', 'high', 'low', 'close',
+            'avg_bid', 'avg_ask', 'max_ask', 'min_bid',
+            'average', 'barCount', 'volume', 'symbol', 'localSymbol', 'conId',
+        ])
+    log.info(f"[history] combined total: {len(df):,} rows")
+    return df
+
+
+def _hist_rows_to_df(rows: list[dict]) -> pd.DataFrame:
+    """Normalise reqHistoricalData rows into the raw-CSV schema."""
+    df = pd.DataFrame(rows)
+    # IB returns date as 'YYYYMMDD  HH:MM:SS' (regular) or unix-ish; parse flexibly
+    def _parse(s: str) -> datetime:
+        s = str(s).strip().replace('  ', ' ')
+        for fmt in ('%Y%m%d %H:%M:%S', '%Y%m%d'):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return pd.to_datetime(s)
+    df['date'] = df['date'].apply(_parse)
+    df['avg_bid']     = df.get('low',  df.get('close'))
+    df['avg_ask']     = df.get('high', df.get('close'))
+    df['max_ask']     = df['avg_ask']
+    df['min_bid']     = df['avg_bid']
+    df['average']     = df.get('wap', df.get('close'))
+    df['vix']         = None
+    df['symbol']      = SYMBOL
+    df['localSymbol'] = SYMBOL
+    df['conId']       = ''
+    df['barCount']    = df.get('barCount', 0)
+    keep = ['date', 'vix', 'open', 'high', 'low', 'close',
+            'avg_bid', 'avg_ask', 'max_ask', 'min_bid',
+            'average', 'barCount', 'volume', 'symbol', 'localSymbol', 'conId']
+    return df[[c for c in keep if c in df.columns]]
+
+
+def prune_old_ref_files(retention_days: int):
+    """Delete ref files older than retention_days (by modification time)."""
+    if retention_days <= 0:
+        return
+    cutoff = time.time() - retention_days * 86400
+    for p in REF_DIR.glob('*.csv'):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                log.info(f"[retention] removed old file {p.name}")
+        except OSError:
+            pass
+
+
+def update_today_partial(df_raw: pd.DataFrame, today: date):
+    """Persist today's rolling bars to stock_{yymmdd}_partial.csv."""
+    mask = pd.to_datetime(df_raw['date']).dt.date == today
+    df_raw.loc[mask].to_csv(stock_file(today, partial=True), index=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATE FILES — position_support.csv + transaction.csv
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PS_COLS = [
+    'position_id',
+    'entry_time', 'entry_price', 'entry_wap', 'shares', 'cash_used',
+    'atr_at_entry', 'rsi_at_entry', 'adx_at_entry', 'vwap_at_entry',
+    'pending_order_id', 'pending_bars',
+    'cc_symbol', 'cc_local_symbol', 'cc_strike', 'cc_expiry', 'cc_right',
+    'cc_open_price', 'cc_open_time', 'cc_tv_at_entry',
+    'cc_mktdata_req_id', 'cc_pending_order_id',
+]
+
+_TX_COLS = [
+    'timestamp', 'position_id', 'leg', 'action',
+    'symbol', 'local_symbol', 'sec_type', 'quantity',
+    'price', 'order_id', 'reason',
+]
+
+
+def load_ps() -> pd.DataFrame:
+    if not POS_SUPPORT_CSV.exists():
+        return pd.DataFrame(columns=_PS_COLS)
+    return pd.read_csv(
+        POS_SUPPORT_CSV,
+        dtype={'position_id': str, 'pending_order_id': str,
+               'cc_mktdata_req_id': str, 'cc_pending_order_id': str,
+               'cc_expiry': str},
+        low_memory=False,
+    )
+
+
+def save_ps(df: pd.DataFrame):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(POS_SUPPORT_CSV, index=False)
+
+
+def _init_tx_file():
+    TRANSACTION_CSV.parent.mkdir(parents=True, exist_ok=True)
+    if not TRANSACTION_CSV.exists():
+        with open(TRANSACTION_CSV, 'w', newline='') as f:
+            csv.DictWriter(f, fieldnames=_TX_COLS).writeheader()
+
+
+def _log_txn(row: dict):
+    with open(TRANSACTION_CSV, 'a', newline='') as f:
+        csv.DictWriter(f, fieldnames=_TX_COLS, extrasaction='ignore').writerow(row)
+    log.info(f"[txn] {row}")
+
+
+def _cancel_cc_sub(app: IBApp, row):
+    try:
+        rid = int(float(row.get('cc_mktdata_req_id') or 0))
+    except (ValueError, TypeError):
+        return
+    if rid > 0:
+        app.cancelMktData(rid)
+        app._cc_prices.pop(rid, None)
+        log.debug(f"[cc sub] cancelled reqId={rid}")
+
+
+def _new_position_id() -> str:
+    return f"pos_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STARTUP SYNC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sync_on_startup(app: IBApp, params: dict) -> pd.DataFrame:
+    """
+    Reconcile IB positions against position_support.csv.
+      - Cancel lingering pending orders tracked in CSV.
+      - Drop CSV rows whose stock position no longer exists in IB.
+      - Flatten IB stock positions not tracked in CSV (MKT SELL).
+      - If a CSV row has a cc_* but IB has no matching call option (CC expired
+        during downtime), flatten the stock and drop the row.
+      - For surviving CSV rows with an open CC: re-subscribe reqMktData on the
+        option contract so TV monitoring resumes.
+    """
+    log.info("[startup] Fetching IB positions ...")
+    ibpos = app.fetch_positions()
+    log.info(f"[startup] {len(ibpos)} IB position(s):")
+    for p in ibpos:
+        log.info(f"  {p['secType']:3s}  {p['localSymbol']:25s}  qty={p['position']}  "
+                 f"avgCost={p['avgCost']}")
+
+    ps = load_ps()
+
+    # Cancel any lingering pending stock-buy orders from last run
+    if not ps.empty:
+        for _, row in ps.iterrows():
+            for col in ('pending_order_id', 'cc_pending_order_id'):
+                oid_str = str(row.get(col, ''))
+                if oid_str and oid_str not in ('nan', '', 'None'):
+                    try:
+                        oid = int(float(oid_str))
+                        log.info(f"[startup] cancelling stale order {oid} "
+                                 f"({col} pos={row['position_id']})")
+                        app.cancelOrder(oid)
+                    except (ValueError, TypeError):
+                        pass
+        ps['pending_order_id']    = None
+        ps['cc_pending_order_id'] = None
+
+    # Build ground truth: stock qty + short calls keyed by (strike, expiry)
+    # (localSymbol strings from IB use padded OSI format; matching on the
+    # structured strike+expiry is more robust than string comparison.)
+    ib_stk_qty = sum(p['position'] for p in ibpos
+                     if p['symbol'] == SYMBOL and p['secType'] == 'STK'
+                     and p['position'] > 0)
+    ib_calls = {
+        (round(float(p['strike']), 4), str(p['expiry'])): p
+        for p in ibpos
+        if p['symbol'] == SYMBOL and p['secType'] == 'OPT'
+        and p['right'] == 'C' and p['position'] < 0
+    }
+
+    # Drop CSV rows with no matching stock or CC coverage in IB
+    keep_rows = []
+    for i, row in ps.iterrows():
+        shares = int(float(row.get('shares') or params['shares_per_position']))
+        cc_sym = str(row.get('cc_local_symbol', '') or '')
+        has_cc_in_csv = cc_sym not in ('', 'nan', 'None')
+        if has_cc_in_csv:
+            cc_key = (round(float(row['cc_strike']), 4), str(row['cc_expiry']))
+            cc_present_in_ib = cc_key in ib_calls
+        else:
+            cc_present_in_ib = False
+        has_stk_in_ib = ib_stk_qty >= shares
+
+        if not has_stk_in_ib:
+            log.info(f"[startup] pos={row['position_id']} — no stock in IB, dropping row")
+            _cancel_cc_sub(app, row)
+            continue
+
+        if has_cc_in_csv and not cc_present_in_ib:
+            # CC expired/closed during downtime.  Flatten the stock.
+            log.info(f"[startup] pos={row['position_id']} — CC {cc_sym} missing in IB "
+                     f"(expired?); MKT SELL stock, dropping row")
+            oid = app.next_order_id()
+            app.placeOrder(oid, _stk_contract(), _market_order('SELL', shares))
+            _log_txn({
+                'timestamp': datetime.now().isoformat(),
+                'position_id': row['position_id'], 'leg': 'stock', 'action': 'SELL',
+                'symbol': SYMBOL, 'local_symbol': SYMBOL, 'sec_type': 'STK',
+                'quantity': shares, 'price': 0, 'order_id': oid,
+                'reason': 'startup_cc_missing',
+            })
+            _cancel_cc_sub(app, row)
+            ib_stk_qty -= shares
+            continue
+
+        # Good row — re-subscribe CC mktdata if present (build contract from
+        # strike+expiry; do NOT pass localSymbol — IB would require canonical form)
+        if has_cc_in_csv:
+            cc_rid = app.next_req_id()
+            app._cc_prices[cc_rid] = {'bid': None, 'ask': None}
+            opt = _option_contract(float(row['cc_strike']), str(row['cc_expiry']))
+            app.reqMktData(cc_rid, opt, '', False, False, [])
+            row['cc_mktdata_req_id'] = cc_rid
+            log.info(f"[startup] resubscribed CC {cc_sym} rid={cc_rid} pos={row['position_id']}")
+        keep_rows.append(row)
+        ib_stk_qty -= shares
+
+    ps = pd.DataFrame(keep_rows, columns=_PS_COLS) if keep_rows else pd.DataFrame(columns=_PS_COLS)
+
+    # Flatten any remaining untracked IB stock qty
+    if ib_stk_qty > 0:
+        log.warning(f"[startup] {ib_stk_qty} untracked {SYMBOL} shares in IB — MKT SELL")
+        oid = app.next_order_id()
+        app.placeOrder(oid, _stk_contract(), _market_order('SELL', int(ib_stk_qty)))
+        _log_txn({
+            'timestamp': datetime.now().isoformat(),
+            'position_id': 'UNKNOWN', 'leg': 'stock', 'action': 'SELL',
+            'symbol': SYMBOL, 'local_symbol': SYMBOL, 'sec_type': 'STK',
+            'quantity': int(ib_stk_qty), 'price': 0, 'order_id': oid,
+            'reason': 'startup_close_untracked',
+        })
+
+    save_ps(ps)
+    log.info(f"[startup] position_support.csv: {len(ps)} active row(s)")
+    return ps
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CASH ACCOUNTING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def current_cash(ps: pd.DataFrame, starting_cash: float) -> float:
+    """Rough cash on hand = starting − sum(cash_used for open positions)."""
+    if ps.empty:
+        return starting_cash
+    used = pd.to_numeric(ps['cash_used'], errors='coerce').fillna(0).sum()
+    return float(starting_cash - used)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY / EXIT LOGIC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ses_minute(dt: datetime) -> int:
+    return dt.hour * 60 + dt.minute
+
+
+def _has_pending(row) -> bool:
+    oid = str(row.get('pending_order_id', ''))
+    return oid not in ('', 'nan', 'None')
+
+
+def _has_cc(row) -> bool:
+    return str(row.get('cc_symbol', '')) not in ('', 'nan', 'None')
+
+
+def _composite_fires(last_row: pd.Series) -> bool:
+    """(any bsig_trend) AND (any bsig_momentum) on the given row."""
+    try:
+        trend_hit = any(int(last_row.get(c, 0)) == 1 for c in BSIG_TREND_COLS)
+        mom_hit   = any(int(last_row.get(c, 0)) == 1 for c in BSIG_MOMENTUM_COLS)
+    except (TypeError, ValueError):
+        return False
+    return trend_hit and mom_hit
+
+
+def _last_entry_time(ps: pd.DataFrame) -> datetime | None:
+    if ps.empty:
+        return None
+    times = pd.to_datetime(ps['entry_time'], errors='coerce').dropna()
+    return times.max() if not times.empty else None
+
+
+def cancel_stale_orders(app: IBApp, ps: pd.DataFrame) -> pd.DataFrame:
+    """Confirm fills and drop orphan pending rows after 2 unconfirmed bars."""
+    if ps.empty:
+        return ps
+    ps = ps.copy()
+    drops: list[int] = []
+    for i, row in ps.iterrows():
+        if not _has_pending(row):
+            continue
+        try:
+            oid = int(float(row['pending_order_id']))
+        except (ValueError, TypeError):
+            drops.append(i)
+            continue
+        st = app.order_status.get(oid, {})
+        status = st.get('status', '')
+        if status == 'Filled':
+            fill = float(st.get('avg_fill', row['entry_price']))
+            ps.at[i, 'entry_price']      = fill
+            ps.at[i, 'entry_wap']        = fill
+            ps.at[i, 'cash_used']        = fill * float(row['shares'])
+            ps.at[i, 'pending_order_id'] = None
+            ps.at[i, 'pending_bars']     = 0
+            log.info(f"[fill] pos={row['position_id']} stock oid={oid} @ {fill}")
+        elif status == '':
+            bars = int(float(row.get('pending_bars') or 0)) + 1
+            ps.at[i, 'pending_bars'] = bars
+            if bars >= 2:
+                log.warning(f"[orders] stock oid={oid} no status after {bars} bars — dropping row")
+                app.cancelOrder(oid)
+                drops.append(i)
+        elif status in ('PreSubmitted', 'Submitted'):
+            log.info(f"[orders] unfilled stock oid={oid} status={status} — cancel + drop row")
+            app.cancelOrder(oid)
+            drops.append(i)
+        else:
+            log.info(f"[orders] stock oid={oid} status={status} — dropping row")
+            drops.append(i)
+    if drops:
+        ps = ps.drop(index=drops).reset_index(drop=True)
+    return ps
+
+
+def check_cc_buybacks(app: IBApp, ps: pd.DataFrame, bar: dict,
+                      bar_dt: datetime, params: dict) -> pd.DataFrame:
+    """
+    TV-based buyback per open CC: option_ask − max(0, stock_bid − strike) < buyback_tv.
+    On trigger: MKT BUY to close the call, MKT SELL the stock.
+    """
+    if ps.empty:
+        return ps
+    bar_bid = float(bar['avg_bid'])
+    buyback_tv = float(params['buyback_tv'])
+    ps = ps.copy()
+    drops: list[int] = []
+
+    for i, row in ps.iterrows():
+        if not _has_cc(row):
+            continue
+        cc_sym = str(row['cc_local_symbol'])
+        try:
+            cc_rid = int(float(row.get('cc_mktdata_req_id') or 0))
+        except (ValueError, TypeError):
+            cc_rid = 0
+        prices = app._cc_prices.get(cc_rid, {}) if cc_rid > 0 else {}
+        ask = prices.get('ask')
+        if ask is None:
+            log.debug(f"[cc monitor] pos={row['position_id']} {cc_sym} no ask yet")
+            continue
+
+        strike = float(row['cc_strike'])
+        intrinsic = max(0.0, bar_bid - strike)
+        tv = ask - intrinsic
+        log.debug(f"[cc monitor] pos={row['position_id']} {cc_sym} ask={ask} "
+                  f"tv={tv:.4f}")
+
+        if tv >= buyback_tv:
+            continue
+
+        shares = int(float(row['shares']))
+        pos_id = row['position_id']
+        log.info(f"[CC buyback] pos={pos_id} {cc_sym} tv={tv:.4f} < {buyback_tv}")
+
+        _cancel_cc_sub(app, row)
+
+        # Resolve contract from strike+expiry fields (do not set localSymbol)
+        opt = _option_contract(strike, str(row['cc_expiry']))
+        cc_oid = app.next_order_id()
+        app.placeOrder(cc_oid, opt, _market_order('BUY', 1))
+        _log_txn({
+            'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
+            'leg': 'option', 'action': 'BUY', 'symbol': SYMBOL,
+            'local_symbol': cc_sym, 'sec_type': 'OPT', 'quantity': 1,
+            'price': ask, 'order_id': cc_oid,
+            'reason': f'buyback_tv_{tv:.4f}',
+        })
+
+        stk_oid = app.next_order_id()
+        app.placeOrder(stk_oid, _stk_contract(), _market_order('SELL', shares))
+        _log_txn({
+            'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
+            'leg': 'stock', 'action': 'SELL', 'symbol': SYMBOL,
+            'local_symbol': SYMBOL, 'sec_type': 'STK', 'quantity': shares,
+            'price': bar_bid, 'order_id': stk_oid,
+            'reason': 'buyback_close_stock',
+        })
+        drops.append(i)
+
+    if drops:
+        ps = ps.drop(index=drops).reset_index(drop=True)
+    return ps
+
+
+def check_cc_expiry(app: IBApp, ps: pd.DataFrame, bar: dict,
+                    bar_dt: datetime) -> pd.DataFrame:
+    """
+    On Friday ≥ 15:45: drop rows whose CC is at expiry.
+      - Stock bid > strike → IB will auto-assign, nothing to place
+      - Stock bid ≤ strike → sell stock at market (CC expires worthless)
+    """
+    if _ses_minute(bar_dt) < EOD_MINUTE or ps.empty:
+        return ps
+    bar_bid = float(bar['avg_bid'])
+    ps = ps.copy()
+    drops: list[int] = []
+
+    for i, row in ps.iterrows():
+        if not _has_cc(row):
+            continue
+        exp_ib = str(row['cc_expiry'])
+        try:
+            exp_d = datetime.strptime(exp_ib, '%Y%m%d').date()
+        except ValueError:
+            continue
+        if bar_dt.date() != exp_d:
+            continue
+        strike = float(row['cc_strike'])
+        shares = int(float(row['shares']))
+        pos_id = row['position_id']
+        if bar_bid > strike:
+            log.info(f"[CC expiry] pos={pos_id} ITM bid={bar_bid} > strike={strike} — IB will assign")
+            _log_txn({
+                'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
+                'leg': 'stock', 'action': 'ASSIGNED', 'symbol': SYMBOL,
+                'local_symbol': SYMBOL, 'sec_type': 'STK', 'quantity': shares,
+                'price': strike, 'order_id': 0,
+                'reason': f'cc_assigned_strike_{strike}',
+            })
+        else:
+            oid = app.next_order_id()
+            app.placeOrder(oid, _stk_contract(), _market_order('SELL', shares))
+            log.info(f"[CC expiry] pos={pos_id} OTM bid={bar_bid} ≤ strike={strike} — MKT SELL stock")
+            _log_txn({
+                'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
+                'leg': 'stock', 'action': 'SELL', 'symbol': SYMBOL,
+                'local_symbol': SYMBOL, 'sec_type': 'STK', 'quantity': shares,
+                'price': bar_bid, 'order_id': oid,
+                'reason': 'cc_expired_otm',
+            })
+        _cancel_cc_sub(app, row)
+        drops.append(i)
+
+    if drops:
+        ps = ps.drop(index=drops).reset_index(drop=True)
+    return ps
+
+
+def check_entry_signal(
+    app:       IBApp,
+    df_ext:    pd.DataFrame,
+    ps:        pd.DataFrame,
+    bar:       dict,
+    bar_dt:    datetime,
+    params:    dict,
+    chain_df:  pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    If composite signal fires + cooldown OK + cash OK + TV in range,
+    open a new position (sequential MKT BUY stock, MKT SELL CC).
+    """
+    if _ses_minute(bar_dt) >= EOD_MINUTE or df_ext.empty:
+        return ps
+
+    # Signal
+    df_sig = add_buy_signals(df_ext.tail(10).copy())
+    if df_sig.empty:
+        return ps
+    last = df_sig.iloc[-1]
+    if not _composite_fires(last):
+        return ps
+
+    # Cooldown
+    cd = timedelta(minutes=int(params['cooldown_minutes']))
+    last_entry = _last_entry_time(ps)
+    if last_entry is not None and (bar_dt - last_entry) < cd:
+        log.debug(f"[entry] skip — cooldown {bar_dt - last_entry} < {cd}")
+        return ps
+
+    # Cash
+    shares = int(params['shares_per_position'])
+    entry_px = float(bar['avg_ask'])
+    cost = entry_px * shares
+    cash = current_cash(ps, float(params['starting_cash']))
+    if cash < cost:
+        log.info(f"[entry] signal fires — insufficient cash ${cash:.2f} < ${cost:.2f}; skip")
+        return ps
+
+    # Resolve option contract
+    try:
+        friday = resolve_expiry_friday(bar_dt.date(), params['expiry_label'])
+    except ValueError as e:
+        log.warning(f"[entry] {e}")
+        return ps
+    exp_ib = friday.strftime('%Y%m%d')
+    strike = resolve_strike(chain_df, exp_ib, entry_px, params['strike_label'])
+    if strike is None:
+        log.info(f"[entry] signal fires — no {params['strike_label']} strike available "
+                 f"for {exp_ib} at entry ${entry_px:.2f}")
+        return ps
+    # Build the option contract from structured fields; do NOT set localSymbol
+    # (IB would then match strictly on the OSI string and reject non-canonical).
+    opt = _option_contract(strike, exp_ib)
+    opt_display = f"{SYMBOL} {friday.strftime('%y%m%d')}C{int(strike * 1000):08d}"
+
+    # Live quote → TV gate
+    bid, ask = app.get_option_quote(opt)
+    if bid is None:
+        log.info(f"[entry] signal fires — no option quote for strike={strike} exp={exp_ib}")
+        return ps
+    cc_tv = bid - max(0.0, entry_px - strike)
+    if cc_tv < float(params['cc_tv_min']):
+        log.info(f"[entry] signal fires — cc_tv {cc_tv:.4f} < {params['cc_tv_min']}; skip")
+        return ps
+    if cc_tv > float(params['cc_tv_max']):
+        log.info(f"[entry] signal fires — cc_tv {cc_tv:.4f} > {params['cc_tv_max']}; skip")
+        return ps
+
+    # Sequential MKT orders
+    pos_id  = _new_position_id()
+    stk_oid = app.next_order_id()
+    app.placeOrder(stk_oid, _stk_contract(), _market_order('BUY', shares))
+    log.info(f"[BUY] pos={pos_id} MKT BUY {shares} @~{entry_px}  stk_oid={stk_oid}")
+    _log_txn({
+        'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
+        'leg': 'stock', 'action': 'BUY', 'symbol': SYMBOL,
+        'local_symbol': SYMBOL, 'sec_type': 'STK', 'quantity': shares,
+        'price': entry_px, 'order_id': stk_oid,
+        'reason': 'composite_signal',
+    })
+
+    cc_oid = app.next_order_id()
+    app.placeOrder(cc_oid, opt, _market_order('SELL', 1))
+    log.info(f"[CC open] pos={pos_id} MKT SELL 1 call strike={strike} exp={exp_ib} "
+             f"bid={bid}  tv={cc_tv:.4f}  cc_oid={cc_oid}")
+    _log_txn({
+        'timestamp': bar_dt.isoformat(), 'position_id': pos_id,
+        'leg': 'option', 'action': 'SELL', 'symbol': SYMBOL,
+        'local_symbol': opt_display, 'sec_type': 'OPT', 'quantity': 1,
+        'price': bid, 'order_id': cc_oid,
+        'reason': f'cc_open_tv_{cc_tv:.4f}',
+    })
+
+    # Persistent option quote subscription for buyback monitoring
+    cc_rid = app.next_req_id()
+    app._cc_prices[cc_rid] = {'bid': None, 'ask': None}
+    app.reqMktData(cc_rid, opt, '', False, False, [])
+
+    last_ext = df_ext.iloc[-1]
+    new_row = {
+        'position_id':          pos_id,
+        'entry_time':           bar_dt.isoformat(),
+        'entry_price':          entry_px,
+        'entry_wap':            float(bar['average']),
+        'shares':               shares,
+        'cash_used':            cost,
+        'atr_at_entry':         float(last_ext.get('atr_14', float('nan'))),
+        'rsi_at_entry':         float(last_ext.get('rsi_14', float('nan'))),
+        'adx_at_entry':         float(last_ext.get('adx_14', float('nan'))),
+        'vwap_at_entry':        float(last_ext.get('vwp_vwap', float('nan'))),
+        'pending_order_id':     stk_oid,
+        'pending_bars':         0,
+        'cc_symbol':            SYMBOL,
+        'cc_local_symbol':      opt_display,
+        'cc_strike':            strike,
+        'cc_expiry':            exp_ib,
+        'cc_right':             'C',
+        'cc_open_price':        bid,
+        'cc_open_time':         bar_dt.isoformat(),
+        'cc_tv_at_entry':       round(cc_tv, 4),
+        'cc_mktdata_req_id':    cc_rid,
+        'cc_pending_order_id':  cc_oid,
+    }
+    ps = pd.concat([ps, pd.DataFrame([new_row])], ignore_index=True)
+    return ps
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BAR LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def process_bar(
+    app:      IBApp,
+    bar:      dict,
+    ps:       pd.DataFrame,
+    df_raw:   pd.DataFrame,
+    params:   dict,
+    chain_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    bar_dt = datetime.strptime(bar['date'], '%Y-%m-%d %H:%M:%S')
+    log.info(f"━━━ bar {bar_dt.strftime('%Y-%m-%d %H:%M')}  "
+             f"close={bar['close']}  wap={bar['average']}  "
+             f"bid={bar['avg_bid']}  ask={bar['avg_ask']}  vix={bar['vix']} ━━━")
+
+    # 1. Append new bar to rolling raw df
+    new_df = pd.DataFrame([bar])
+    new_df['date'] = pd.to_datetime(new_df['date'])
+    df_raw = (pd.concat([df_raw, new_df], ignore_index=True)
+                .drop_duplicates(subset='date')
+                .sort_values('date')
+                .reset_index(drop=True)
+                .tail(MAX_BARS)
+                .reset_index(drop=True))
+
+    # 2. Recompute indicators + buy signals
+    try:
+        df_ext = compute_indicators(df_raw.copy())
+    except Exception as exc:
+        log.exception(f"[bar] compute_indicators failed: {exc}")
+        df_ext = df_raw.copy()
+
+    # 3. Persist today's partial CSV (one file per session day)
+    try:
+        update_today_partial(df_raw, bar_dt.date())
+    except Exception as exc:
+        log.warning(f"[bar] update_today_partial failed: {exc}")
+
+    # 4. Order lifecycle + exit checks
+    ps = cancel_stale_orders(app, ps)
+    ps = check_cc_buybacks(app, ps, bar, bar_dt, params)
+    ps = check_cc_expiry(app, ps, bar, bar_dt)
+
+    # 5. Entry evaluation (last so exits run first)
+    ps = check_entry_signal(app, df_ext, ps, bar, bar_dt, params, chain_df)
+
+    save_ps(ps)
+    return ps, df_raw, df_ext
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMMEDIATE TV CHECK ON STARTUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def immediate_tv_check(app: IBApp, ps: pd.DataFrame, params: dict,
+                       wait_secs: float = 6.0) -> pd.DataFrame:
+    """
+    After startup resubscribe, wait briefly for option asks to arrive, then
+    check TV for every open CC.  Close any position already below threshold.
+    """
+    if ps.empty:
+        return ps
+    if app._current_bid is None:
+        log.info(f"[startup] waiting {wait_secs}s for bid/ask ticks ...")
+        time.sleep(wait_secs)
+    else:
+        time.sleep(2.0)   # give CC subs a moment
+    stk_bid = app._current_bid or 0.0
+    if stk_bid <= 0:
+        log.info("[startup] no stock bid yet — deferring TV check to next bar")
+        return ps
+    synthetic_bar = {
+        'avg_bid': stk_bid,
+        'avg_ask': app._current_ask or stk_bid,
+        'average': stk_bid,
+    }
+    return check_cc_buybacks(app, ps, synthetic_bar, datetime.now(), params)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    log.info("=" * 72)
+    log.info(f"arbo702 starting up  params={PARAMS}")
+    log.info("=" * 72)
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    REF_DIR.mkdir(parents=True, exist_ok=True)
+    _init_tx_file()
+    prune_old_ref_files(int(PARAMS['retention_days']))
+
+    # ── IB connect ────────────────────────────────────────────────────────────
+    app = IBApp()
+    app.connect(PARAMS['host'], int(PARAMS['port']), int(PARAMS['client_id']))
+    ib_thread = threading.Thread(target=app.run, daemon=True, name='ib-api')
+    ib_thread.start()
+    if not app._connected_event.wait(timeout=CONN_TIMEOUT):
+        log.error(f"Could not connect to TWS at {PARAMS['host']}:{PARAMS['port']}")
+        sys.exit(1)
+    time.sleep(1)
+
+    # ── Reference data ────────────────────────────────────────────────────────
+    today = date.today()
+    chain_df = ensure_contracts(app, today)
+
+    # ── Startup reconcile ─────────────────────────────────────────────────────
+    ps = sync_on_startup(app, PARAMS)
+
+    # ── Historical bootstrap ──────────────────────────────────────────────────
+    df_raw = ensure_stock_history(app, today)
+
+    # ── Live subscriptions (stock, VIX, 5-sec bars) ───────────────────────────
+    app.reqMktData(REQ_STK_MKTDATA, _stk_contract(), '', False, False, [])
+    log.info(f"[IB] reqMktData {SYMBOL} bid/ask  rid={REQ_STK_MKTDATA}")
+    app.reqMktData(REQ_VIX_MKTDATA, _vix_contract(), '', False, False, [])
+    log.info(f"[IB] reqMktData VIX               rid={REQ_VIX_MKTDATA}")
+    app.reqRealTimeBars(REQ_STK_RTBARS, _stk_contract(), 5, 'TRADES', True, [])
+    log.info(f"[IB] reqRealTimeBars {SYMBOL}     rid={REQ_STK_RTBARS}")
+
+    # ── Immediate TV check on any resumed CCs ─────────────────────────────────
+    ps = immediate_tv_check(app, ps, PARAMS)
+    save_ps(ps)
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    log.info("[loop] entering bar loop")
+    df_ext = df_raw.copy()
+    while True:
+        try:
+            bar = app.bar_queue.get(timeout=120)
+        except queue.Empty:
+            log.warning("[loop] no bar in 120s — market closed or IB stall")
+            continue
+        try:
+            ps, df_raw, df_ext = process_bar(app, bar, ps, df_raw, PARAMS, chain_df)
+        except Exception as exc:
+            log.exception(f"[loop] bar {bar.get('date')} failed: {exc}")
+
+
+if __name__ == '__main__':
+    main()
