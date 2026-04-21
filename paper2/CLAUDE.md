@@ -17,9 +17,10 @@ paper2/
 │       ├── stock_{yymmdd}.csv          # yesterday's 1-min bars (HMDS)
 │       └── stock_{yymmdd}_partial.csv  # today's rolling bars (live)
 ├── logs/
-│   ├── arbo702_ops.log                 # hourly-rotating operations log
-│   ├── arbo702_market.log              # tick/bar debug log
-│   └── arbo702_trade.log               # trade events only
+│   └── {YYYYMMDD}/                     # one directory per trading day
+│       ├── ops.log                     # operations log (INFO+)
+│       ├── market.log                  # tick/bar debug (DEBUG+)
+│       └── trade.log                   # trade-lifecycle events only
 └── ec2/                                # deployment artefacts
 ```
 

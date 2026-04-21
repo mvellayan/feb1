@@ -34,7 +34,7 @@ Files created by this program
   paper2/data/ref/stock_{yymmdd}_partial.csv            today's rolling 1-min bars
   paper2/data/position_support.csv                      live position state
   paper2/data/transaction.csv                           append-only trade log
-  paper2/logs/arbo702_{ops,market,trade}.log            hourly-rotating logs
+  paper2/logs/{YYYYMMDD}/{ops,market,trade}.log         one dir per trading day
 
 Restart idempotency
 ───────────────────
@@ -55,7 +55,6 @@ import sys
 import threading
 import time
 from datetime import datetime, date, timedelta
-from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import numpy as np
@@ -214,7 +213,50 @@ def stock_file(d: date, partial: bool = False) -> Path:
 # LOGGING
 # ══════════════════════════════════════════════════════════════════════════════
 
+class _DailyDirFileHandler(logging.FileHandler):
+    """
+    FileHandler whose output path is `<root>/<YYYYMMDD>/<name>`.  The
+    date component is re-checked on each emit; if the local date has
+    advanced, we close the current file and open a new one under the new
+    date directory.  This keeps an overnight-running session's log lines
+    segregated by calendar day without needing a rotation handler.
+    """
+
+    def __init__(self, root: Path, name: str, encoding: str = 'utf-8'):
+        self._root = Path(root)
+        self._name = name
+        self._current_day: str | None = None
+        self._ensure_day()
+        super().__init__(self.baseFilename, mode='a', encoding=encoding, delay=False)
+
+    def _ensure_day(self) -> bool:
+        today = datetime.now().strftime('%Y%m%d')
+        if today != self._current_day:
+            day_dir = self._root / today
+            day_dir.mkdir(parents=True, exist_ok=True)
+            self.baseFilename = str(day_dir / self._name)
+            self._current_day = today
+            return True
+        return False
+
+    def emit(self, record):
+        if self._ensure_day() and self.stream is not None:
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None   # FileHandler.emit will _open() on next write
+        super().emit(record)
+
+
 def _setup_logging() -> logging.Logger:
+    """
+    Logs land in `paper2/logs/YYYYMMDD/<name>.log`.  Three streams per day:
+      ops.log     — INFO and above, everything EXCEPT trade/market prefixes
+      market.log  — DEBUG and above, only [tick] / [bar] / [cc monitor] lines
+      trade.log   — INFO and above, only trade-lifecycle-tagged lines
+    Plus a stdout stream (INFO, no market-prefix noise).
+    """
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter('%(asctime)s  %(levelname)-7s  %(message)s',
                             datefmt='%H:%M:%S')
@@ -232,23 +274,19 @@ def _setup_logging() -> logging.Logger:
             m = any(msg.startswith(p) for p in self.pfx)
             return m if self.include else not m
 
-    def _h(name: str, level: int) -> TimedRotatingFileHandler:
-        h = TimedRotatingFileHandler(
-            LOGS_DIR / name, when='H', interval=1, backupCount=24 * 14,
-            encoding='utf-8',
-        )
-        h.suffix = '%Y%m%d_%H'
+    def _h(name: str, level: int) -> _DailyDirFileHandler:
+        h = _DailyDirFileHandler(LOGS_DIR, name)
         h.setLevel(level)
         h.setFormatter(fmt)
         return h
 
-    ops = _h('arbo702_ops.log', logging.INFO)
+    ops = _h('ops.log', logging.INFO)
     ops.addFilter(_Pref(trade_prefixes + market_prefixes, include=False))
 
-    mkt = _h('arbo702_market.log', logging.DEBUG)
+    mkt = _h('market.log', logging.DEBUG)
     mkt.addFilter(_Pref(market_prefixes, include=True))
 
-    tr = _h('arbo702_trade.log', logging.INFO)
+    tr = _h('trade.log', logging.INFO)
     tr.addFilter(_Pref(trade_prefixes, include=True))
 
     ch = logging.StreamHandler()
@@ -550,12 +588,17 @@ class IBApp(EWrapper, EClient):
         bid = self._opt_bid.pop(rid, None)
         ask = self._opt_ask.pop(rid, None)
         self._opt_done.pop(rid, None)
+        # Identify the contract we queried (localSymbol is not set on our
+        # construction; show strike/expiry/right so concurrent calls for
+        # different strikes can be told apart in the log)
+        desc = (contract.localSymbol
+                or f"{contract.symbol} {contract.lastTradeDateOrContractMonth} "
+                   f"{contract.right}{contract.strike}")
         if bid or ask:
-            log.info(f"[opt quote] {contract.localSymbol or contract.symbol}  "
-                     f"bid={bid}  ask={ask}  "
-                     f"({'both' if (bid and ask) else 'partial'})")
+            log.debug(f"[opt quote] {desc}  bid={bid}  ask={ask}  "
+                      f"({'both' if (bid and ask) else 'partial'})")
         else:
-            log.info(f"[opt quote] {contract.localSymbol or contract.symbol}  no quote")
+            log.debug(f"[opt quote] {desc}  no quote")
         return bid, ask
 
     def fetch_option_chain(self, symbol: str,
@@ -1467,10 +1510,10 @@ def check_entry_signal(
     chain_df:  pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Run the composite signal once, then evaluate every strategy in
-    params['strategies'] independently.  Each strategy has its own
-    shares_per_position, cooldown, TV range, buyback_tv, expiry_label,
-    strike_label.  Strategies fire in declared order; cash is a shared pool.
+    Every bar: log a per-strategy snapshot (quote, cc_tv, gate decision),
+    then — if the composite fires — try to open a position for each strategy.
+    Composite signal is one of the gates shown in the snapshot.  Actual
+    orders are placed only when ALL gates pass.
     """
     if _ses_minute(bar_dt) >= EOD_MINUTE or df_ext.empty:
         return ps
@@ -1480,18 +1523,128 @@ def check_entry_signal(
     if df_sig.empty:
         return ps
     last = df_sig.iloc[-1]
-    if not _composite_fires(last):
-        return ps
+    trend_hits = [c.replace('bsig_', '')
+                  for c in BSIG_TREND_COLS if int(last.get(c, 0)) == 1]
+    mom_hits   = [c.replace('bsig_', '')
+                  for c in BSIG_MOMENTUM_COLS if int(last.get(c, 0)) == 1]
+    sig_fires  = bool(trend_hits) and bool(mom_hits)
 
     last_ext = df_ext.iloc[-1]
     entry_px = float(bar['avg_ask'])
+
+    # Per-bar snapshot — runs unconditionally, logs quote + TV + decision
+    # for every strategy.  Returns a cache so _try_open_for_strategy can
+    # reuse the fetched quote / resolved strike on firing bars.
+    quote_cache = _log_strategy_snapshot(
+        app, ps, bar_dt, entry_px, params, chain_df,
+        sig_fires, trend_hits, mom_hits,
+    )
+
+    if not sig_fires:
+        return ps
 
     for strategy_id, strat in enumerate(params['strategies']):
         ps = _try_open_for_strategy(
             app, strategy_id, strat, ps, bar, bar_dt,
             entry_px, last_ext, params, chain_df,
+            precomputed=quote_cache.get(strategy_id),
         )
     return ps
+
+
+def _log_strategy_snapshot(
+    app:         IBApp,
+    ps:          pd.DataFrame,
+    bar_dt:      datetime,
+    entry_px:    float,
+    params:      dict,
+    chain_df:    pd.DataFrame,
+    sig_fires:   bool,
+    trend_hits:  list,
+    mom_hits:    list,
+) -> dict:
+    """
+    For every configured strategy, resolve its (expiry, strike), fetch the
+    live call-option quote, compute cc_tv, evaluate every entry gate, and
+    log a one-line verdict.  Runs on every bar — composite-miss bars included.
+
+    Returns {strategy_id: {'strike','exp_ib','bid','ask'}} so the subsequent
+    entry attempt on firing bars can reuse the same quote without a refetch.
+    """
+    log.info(
+        f"[snap] composite: "
+        f"trend={len(trend_hits)}/{len(BSIG_TREND_COLS)} "
+        f"({','.join(trend_hits) if trend_hits else '-'})  "
+        f"mom={len(mom_hits)}/{len(BSIG_MOMENTUM_COLS)} "
+        f"({','.join(mom_hits) if mom_hits else '-'})  "
+        f"fires={'Y' if sig_fires else 'N'}"
+    )
+
+    cache: dict = {}
+    cash = current_cash(ps, float(params['starting_cash']))
+
+    for strategy_id, strat in enumerate(params['strategies']):
+        exp_label = strat['expiry_label']
+        strk_label = strat['strike_label']
+
+        try:
+            friday = resolve_expiry_friday(bar_dt.date(), exp_label)
+        except ValueError as e:
+            log.info(f"[snap] strat={strategy_id} {exp_label}/{strk_label}  "
+                     f"bad expiry_label: {e}")
+            continue
+        exp_ib = friday.strftime('%Y%m%d')
+
+        strike = resolve_strike(chain_df, exp_ib, entry_px, strk_label)
+        if strike is None:
+            log.info(f"[snap] strat={strategy_id} {exp_label}/{strk_label}  "
+                     f"no strike in chain at ${entry_px:.2f} exp={exp_ib}")
+            continue
+
+        opt      = _option_contract(strike, exp_ib)
+        bid, ask = app.get_option_quote(opt)
+        cache[strategy_id] = {
+            'strike': strike, 'exp_ib': exp_ib, 'bid': bid, 'ask': ask,
+        }
+
+        tv_min = float(strat['cc_tv_min'])
+        tv_max = float(strat['cc_tv_max'])
+        if bid is not None:
+            cc_tv     = bid - max(0.0, entry_px - strike)
+            tv_in_rng = tv_min <= cc_tv <= tv_max
+            tv_str    = f'{cc_tv:.4f}'
+        else:
+            cc_tv     = None
+            tv_in_rng = False
+            tv_str    = 'N/A'
+
+        cd = timedelta(minutes=int(strat['cooldown_minutes']))
+        last_entry = _last_entry_time_for_strategy(ps, strategy_id)
+        cooldown_ok = last_entry is None or (bar_dt - last_entry) >= cd
+
+        shares  = int(strat['shares_per_position'])
+        cost    = entry_px * shares
+        cash_ok = cash >= cost
+
+        gates_failed = []
+        if not sig_fires:   gates_failed.append('signal')
+        if not cooldown_ok: gates_failed.append('cooldown')
+        if not cash_ok:     gates_failed.append('cash')
+        if bid is None:     gates_failed.append('no_quote')
+        elif not tv_in_rng:
+            gates_failed.append('tv_low' if cc_tv < tv_min else 'tv_high')
+
+        decision = 'BUY' if not gates_failed else f"SKIP [{','.join(gates_failed)}]"
+
+        bid_s = f'{bid:.2f}' if bid is not None else 'N/A'
+        ask_s = f'{ask:.2f}' if ask is not None else 'N/A'
+        log.info(
+            f"[snap] strat={strategy_id} {exp_label}/{strk_label} "
+            f"K={strike:g} exp={exp_ib}  bid={bid_s} ask={ask_s}  "
+            f"cc_tv={tv_str} in [{tv_min:g},{tv_max:g}]  "
+            f"cash=${cash:,.0f}  → {decision}"
+        )
+    return cache
 
 
 def _try_open_for_strategy(
@@ -1505,8 +1658,15 @@ def _try_open_for_strategy(
     last_ext:     pd.Series,
     params:       dict,
     chain_df:     pd.DataFrame,
+    precomputed:  dict | None = None,
 ) -> pd.DataFrame:
-    """Per-strategy entry evaluation; opens one position iff all gates pass."""
+    """Per-strategy entry evaluation; opens one position iff all gates pass.
+
+    `precomputed` — if supplied by the snapshot pass — contains
+    {'strike','exp_ib','bid','ask'} so we skip the redundant chain/quote
+    lookup.  The gates below still run end-to-end to keep this function
+    self-contained; only the IB round-trips are elided.
+    """
     # Cooldown — per strategy
     cd = timedelta(minutes=int(strat['cooldown_minutes']))
     last_entry = _last_entry_time_for_strategy(ps, strategy_id)
@@ -1524,25 +1684,33 @@ def _try_open_for_strategy(
                  f"${cash:.2f} < ${cost:.2f}; skip")
         return ps
 
-    # Resolve option contract for this strategy's expiry_label / strike_label
+    # Resolve expiry (needed for opt_display, even when we have the cache)
     try:
         friday = resolve_expiry_friday(bar_dt.date(), strat['expiry_label'])
     except ValueError as e:
         log.warning(f"[entry] strat={strategy_id} bad expiry_label: {e}")
         return ps
-    exp_ib = friday.strftime('%Y%m%d')
-    strike = resolve_strike(chain_df, exp_ib, entry_px, strat['strike_label'])
-    if strike is None:
-        log.info(f"[entry] strat={strategy_id} — no {strat['strike_label']} "
-                 f"strike available for {exp_ib} at entry ${entry_px:.2f}")
-        return ps
 
-    # Build contract from structured fields (no localSymbol)
+    if precomputed:
+        exp_ib = precomputed['exp_ib']
+        strike = precomputed['strike']
+        bid    = precomputed['bid']
+        ask    = precomputed['ask']
+    else:
+        exp_ib = friday.strftime('%Y%m%d')
+        strike = resolve_strike(chain_df, exp_ib, entry_px, strat['strike_label'])
+        if strike is None:
+            log.info(f"[entry] strat={strategy_id} — no {strat['strike_label']} "
+                     f"strike available for {exp_ib} at entry ${entry_px:.2f}")
+            return ps
+        opt = _option_contract(strike, exp_ib)
+        bid, ask = app.get_option_quote(opt)
+
+    # Build contract from structured fields (no localSymbol) — needed for the
+    # persistent mktData subscription after the BAG fills.
     opt = _option_contract(strike, exp_ib)
     opt_display = f"{SYMBOL} {friday.strftime('%y%m%d')}C{int(strike * 1000):08d}"
 
-    # Live quote → TV gate
-    bid, ask = app.get_option_quote(opt)
     if bid is None:
         log.info(f"[entry] strat={strategy_id} — no option quote for "
                  f"strike={strike} exp={exp_ib}")
