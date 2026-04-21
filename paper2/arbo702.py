@@ -858,11 +858,47 @@ def resolve_strike(chain_df: pd.DataFrame, expiry_ib: str,
 _chain_cache: tuple[date, pd.DataFrame] | None = None
 
 
+CHAIN_FETCH_ATTEMPTS       = 3           # total tries before giving up on IB
+CHAIN_FETCH_RETRY_INTERVAL = 180          # seconds between retries (3 min)
+
+
+def _most_recent_cached_chain(before: date) -> Path | None:
+    """Most recent contracts_{yymmdd}.csv strictly earlier than `before`, or None."""
+    if not REF_DIR.exists():
+        return None
+    candidates: list[tuple[date, Path]] = []
+    for p in REF_DIR.glob('contracts_*.csv'):
+        stem = p.stem.split('_', 1)[1]   # "260420"
+        if len(stem) != 6 or not stem.isdigit():
+            continue
+        try:
+            d = datetime.strptime(stem, '%y%m%d').date()
+        except ValueError:
+            continue
+        if d < before:
+            candidates.append((d, p))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][1]
+
+
 def ensure_contracts(app: IBApp, today: date) -> pd.DataFrame:
     """
-    Return the option chain for SYMBOL as of `today`.  Loads from the
-    date-stamped cache file if present, else queries IB and persists.
-    Called once per day.
+    Return the option chain for SYMBOL as of `today`.
+
+    Resolution order:
+      1. In-process cache (`_chain_cache`) if same date
+      2. `data/ref/contracts_{today}.csv` from disk
+      3. IB `reqContractDetails`, retried up to CHAIN_FETCH_ATTEMPTS times
+         with CHAIN_FETCH_RETRY_INTERVAL seconds between attempts.  On
+         success the result is persisted to disk as today's chain.
+      4. Fallback: the most recent `contracts_{yymmdd}.csv` on disk from
+         an earlier date.  Loaded with a loud warning and NOT saved as
+         today's file, so tomorrow's startup tries IB fresh.
+
+    Raises RuntimeError only if both IB and any earlier cached chain are
+    unavailable.
     """
     global _chain_cache
     if _chain_cache and _chain_cache[0] == today:
@@ -873,14 +909,51 @@ def ensure_contracts(app: IBApp, today: date) -> pd.DataFrame:
     if path.exists():
         df = pd.read_csv(path, dtype={'expiry': str, 'conId': 'Int64'})
         log.info(f"[chain] loaded {len(df):,} rows from {path.name}")
-    else:
-        log.info(f"[chain] {path.name} missing — reqContractDetails for {SYMBOL} calls")
-        rows = app.fetch_option_chain(SYMBOL)
-        if not rows:
-            raise RuntimeError(f"reqContractDetails returned 0 rows for {SYMBOL}")
+        _chain_cache = (today, df)
+        return df
+
+    log.info(f"[chain] {path.name} missing — reqContractDetails for {SYMBOL} calls")
+    rows: list = []
+    for attempt in range(1, CHAIN_FETCH_ATTEMPTS + 1):
+        try:
+            rows = app.fetch_option_chain(SYMBOL)
+        except Exception as exc:
+            log.warning(f"[chain] attempt {attempt}/{CHAIN_FETCH_ATTEMPTS} "
+                        f"raised {type(exc).__name__}: {exc}")
+            rows = []
+        if rows:
+            break
+        if attempt < CHAIN_FETCH_ATTEMPTS:
+            log.warning(f"[chain] attempt {attempt}/{CHAIN_FETCH_ATTEMPTS} "
+                        f"returned 0 rows; retrying in "
+                        f"{CHAIN_FETCH_RETRY_INTERVAL}s ...")
+            time.sleep(CHAIN_FETCH_RETRY_INTERVAL)
+        else:
+            log.warning(f"[chain] attempt {attempt}/{CHAIN_FETCH_ATTEMPTS} "
+                        f"returned 0 rows; giving up on IB for this bootstrap")
+
+    if rows:
         df = pd.DataFrame(rows)
         df.to_csv(path, index=False)
         log.info(f"[chain] wrote {len(df):,} rows → {path.name}")
+        _chain_cache = (today, df)
+        return df
+
+    # Fallback: most recent earlier cached chain
+    fallback = _most_recent_cached_chain(today)
+    if fallback is None:
+        raise RuntimeError(
+            f"reqContractDetails returned 0 rows for {SYMBOL} and no earlier "
+            f"cached chain in {REF_DIR}"
+        )
+    df = pd.read_csv(fallback, dtype={'expiry': str, 'conId': 'Int64'})
+    age_days = (today - datetime.strptime(
+        fallback.stem.split('_', 1)[1], '%y%m%d').date()).days
+    log.warning(
+        f"[chain] !! IB unavailable — falling back to {fallback.name} "
+        f"({age_days} day(s) old, {len(df):,} rows).  "
+        f"Strike coverage may be stale; tomorrow will retry IB fresh."
+    )
     _chain_cache = (today, df)
     return df
 
