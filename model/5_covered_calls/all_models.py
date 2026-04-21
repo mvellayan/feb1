@@ -1,31 +1,43 @@
 """
 all_models.py — 5_covered_calls
 
-Signal-driven covered-call strategy with "union" composite buy signal.
+Signal-driven covered-call strategy with 4 signal-gate modes per variant.
 
 Entry
 ─────
-For each window, the entry universe is bars where BOTH:
-    (any bsig_trend is 1)   AND   (any bsig_momentum is 1)
+For each window, each variant is a triple (signal_mode, expiry_label,
+strike_label).  A bar is an entry candidate for a variant iff:
+
+    signal_mode = 'none'           always (no signal filter)
+                  'trend_only'     (any bsig_trend is 1)
+                  'momentum_only'  (any bsig_momentum is 1)
+                  'both'           (any bsig_trend is 1) AND (any bsig_momentum is 1)
 
     TREND    = ['ema','macd','adx','sar','don','arn','vtx']
     MOMENTUM = ['rsi','sto','cci','cmo','tsi','roc','frc','srsi','rmi','macd']
 
-Signal-fired bars are iterated in chronological order (no random draw).
-For each active (expiry_label, strike_label) variant, look up the sold-call
-bid at entry_ts and compute the opening time value:
+Eligible bars (session + spike filters) are iterated chronologically — no
+random draw.  For each candidate variant, look up the sold-call bid at
+entry_ts and compute the opening time value:
 
     cc_tv = option_bid(entry_ts) - max(0, avg_ask(entry_ts) - strike)
 
 Open the position iff:
   - variant has a valid option quote (≤ MAX_QUOTE_AGE_MINUTES old)
   - cc_tv_min ≤ cc_tv ≤ cc_tv_max
-  - at least COOLDOWN_MINUTES have passed since the variant's last accepted entry
+  - at least COOLDOWN_MINUTES have passed since *this full variant's*
+    last accepted entry  (cooldown is per (signal_mode, expiry, strike))
 
-Batch counter (per variant):
+Batch counter (per full variant):
   - --batch_size is the per-variant cap on accepted entries.
-  - Window ends when every variant has filled its batch OR all signal-fire
+  - Window ends when every variant has filled its batch OR all eligible
     bars have been exhausted.
+
+Default variant matrix
+──────────────────────
+4 signal modes × 3 expiry labels × 6 strike labels = 72 variants.
+CLI flags --expiry-label / --strike-label shrink the last two dimensions;
+the signal-mode dimension always includes all four modes.
 
 Exit (per position)
 ───────────────────
@@ -96,7 +108,19 @@ SIGNALS_CSV  = _BASE / 'data/stock/sq_AAPL_signals.csv'
 TREND    = ['ema', 'macd', 'adx', 'sar', 'don', 'arn', 'vtx']
 MOMENTUM = ['rsi', 'sto', 'cci', 'cmo', 'tsi', 'roc', 'frc', 'srsi', 'rmi', 'macd']
 
+# Per-variant signal-gate modes.  A variant always activates in all four
+# modes — giving a 4× expansion of the expiry × strike matrix.
+SIGNAL_MODES = ['none', 'trend_only', 'momentum_only', 'both']
+
 _BSIG_COLS = sorted({f'bsig_{k}' for k in (TREND + MOMENTUM)})
+
+
+def _signal_mode_fires(mode: str, trend_any: bool, mom_any: bool) -> bool:
+    if mode == 'none':          return True
+    if mode == 'trend_only':    return trend_any
+    if mode == 'momentum_only': return mom_any
+    if mode == 'both':          return trend_any and mom_any
+    raise ValueError(f"unknown signal_mode: {mode!r}")
 
 _REQUIRED_COLS = [
     'date', 'fnd_trade_date',
@@ -138,10 +162,13 @@ def prepare_window(
     seed:         int,   # retained for API compat; entry selection is deterministic
 ) -> tuple:
     """
-    Filter to window, apply session/spike filters, AND require the union
-    buy-signal composite to fire:
-        (any bsig_trend == 1) AND (any bsig_momentum == 1)
-    Returns a chronologically-sorted list of signal-fire bar indices.
+    Filter to window and apply session/spike/NaN filters.  Does NOT apply
+    a buy-signal gate — each variant's `signal_mode` decides per-bar.
+
+    Attaches `_trend_any` and `_mom_any` boolean columns so run_window_batch
+    can check the per-variant signal-mode gate without re-scanning bsig cols.
+
+    Returns (df_window, eligible_idx_list) sorted chronologically.
     """
     mask = (
         (df_full['date'] >= pd.Timestamp(window_start)) &
@@ -156,23 +183,21 @@ def prepare_window(
     if not trend_cols or not mom_cols:
         return None, 'missing_bsig_cols'
 
-    trend_any = df[trend_cols].to_numpy().any(axis=1)
-    mom_any   = df[mom_cols].to_numpy().any(axis=1)
+    df['_trend_any'] = df[trend_cols].to_numpy().any(axis=1)
+    df['_mom_any']   = df[mom_cols].to_numpy().any(axis=1)
 
     valid_mask = (
         (df['ses_after_10']   == 1) &
         (df['ses_before_345'] == 1) &
         (df['atr_spike']      == 0) &
         df['avg_ask'].notna() &
-        df['avg_bid'].notna() &
-        trend_any & mom_any
+        df['avg_bid'].notna()
     )
-    signal_idx = df.index[valid_mask].to_numpy()
-    if len(signal_idx) == 0:
-        return None, 'no_signal_bars'
+    eligible_idx = df.index[valid_mask].to_numpy()
+    if len(eligible_idx) == 0:
+        return None, 'no_eligible_bars'
 
-    # Chronological order — cooldown prunes as we walk
-    return (df, signal_idx.tolist()), 'ok'
+    return (df, eligible_idx.tolist()), 'ok'
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -407,21 +432,24 @@ def run_window_batch(
     log_fh=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, int]:
     """
-    Execute one window.  Returns (summary_df, trades_df, fires_seen).
-    signal_idx is a chronologically-sorted list of bars where the union
-    composite buy signal fired.
+    Execute one window.  variants_selected is a list of
+    (signal_mode, expiry_label, strike_label) tuples.  signal_idx is the
+    chronologically-sorted list of session-eligible bars (no signal gate
+    baked in — each variant's signal_mode is checked per-bar here).
+    Returns (summary_df, trades_df, fires_seen).
     """
     var_state = {
         key: {
-            'last_entry_ts':  None,
-            'accepted_count': 0,
-            'no_quote':       0,
-            'tv_fail_low':    0,
-            'tv_fail_high':   0,
-            'cooldown_skip':  0,
-            'accepted':       0,
-            'trades':         [],
-            'positions':      [],
+            'last_entry_ts':   None,
+            'accepted_count':  0,
+            'signal_skip':     0,
+            'no_quote':        0,
+            'tv_fail_low':     0,
+            'tv_fail_high':    0,
+            'cooldown_skip':   0,
+            'accepted':        0,
+            'trades':          [],
+            'positions':       [],
         }
         for key in variants_selected
     }
@@ -439,18 +467,33 @@ def run_window_batch(
         entry_price = float(row['avg_ask'])
         entry_ts    = pd.Timestamp(row['date'])
         entry_date  = entry_ts.date()
+        trend_any   = bool(row['_trend_any'])
+        mom_any     = bool(row['_mom_any'])
 
         accepted_this_draw = []   # list of (key, variant, cc_tv)
         fires_seen        += 1
 
+        # Cache option-chain lookups per (expiry, strike) within this bar —
+        # all four signal modes for the same (expiry, strike) hit the same
+        # option contract, so we only need to resolve it once.
+        opt_cache: dict[tuple[str, str], dict | None] = {}
+
         for key in variants_selected:
             if var_state[key]['accepted_count'] >= batch_size:
                 continue
-            expiry_label, strike_label = key
+            signal_mode, expiry_label, strike_label = key
 
-            variant = find_cc_variant(
-                entry_date, entry_ts, entry_price, expiry_label, strike_label,
-            )
+            if not _signal_mode_fires(signal_mode, trend_any, mom_any):
+                var_state[key]['signal_skip'] += 1
+                continue
+
+            opt_key = (expiry_label, strike_label)
+            if opt_key not in opt_cache:
+                opt_cache[opt_key] = find_cc_variant(
+                    entry_date, entry_ts, entry_price, expiry_label, strike_label,
+                )
+            variant = opt_cache[opt_key]
+
             if variant is None or variant['open_price'] is None:
                 var_state[key]['no_quote'] += 1
                 continue
@@ -481,6 +524,7 @@ def run_window_batch(
         entry_trade_rows = []
 
         for key, variant, cc_tv in accepted_this_draw:
+            signal_mode, expiry_label, strike_label = key
             result = simulate_variant_tv(
                 df, global_idx, variant, entry_price, buyback_tv, SHARES,
             )
@@ -488,11 +532,12 @@ def run_window_batch(
             trade_row = {
                 'batch_no':       seq_no,
                 'trade_no':       trade_no,
+                'signal_mode':    signal_mode,
                 'entry_time':     str(row['date']),
                 'entry_price':    round(entry_price, 4),
                 'cc_tv_at_entry': round(cc_tv, 4),
-                'expiry_label':   key[0],
-                'strike_label':   key[1],
+                'expiry_label':   expiry_label,
+                'strike_label':   strike_label,
                 'variant_key':    variant['variant_key'],
                 'strike':         variant['strike'],
                 'expiry_date':    str(variant['expiry_date']),
@@ -536,15 +581,17 @@ def run_window_batch(
     summary_rows = []
     for key in variants_selected:
         st = var_state[key]
-        expiry_label, strike_label = key
-        draws = (st['no_quote'] + st['tv_fail_low'] + st['tv_fail_high']
-                 + st['cooldown_skip'] + st['accepted'])
+        signal_mode, expiry_label, strike_label = key
+        draws = (st['signal_skip'] + st['no_quote'] + st['tv_fail_low']
+                 + st['tv_fail_high'] + st['cooldown_skip'] + st['accepted'])
         base = {
             'batch_no':       seq_no,
+            'signal_mode':    signal_mode,
             'expiry_label':   expiry_label,
             'strike_label':   strike_label,
             'variant_key':    f"{expiry_label}/{strike_label}",
             'draws':          draws,
+            'signal_skip':    st['signal_skip'],
             'no_quote':       st['no_quote'],
             'tv_fail_low':    st['tv_fail_low'],
             'tv_fail_high':   st['tv_fail_high'],
@@ -605,26 +652,27 @@ def _log_trade(fh, trade_no, row, entry_snap, entry_trade_rows):
         f"VWAP: ${_fmt(entry_snap.get('vwap_at_entry'))}\n\n"
     )
 
-    fh.write(' +----------+--------+--------+-----------+--------+---------------------+--------------+---------+---------+---------+\n')
-    fh.write(' | Variant  | Expiry | Strike | Open Bid  | cc_tv  | Exit Time           | Exit Reason  | Stock$  | Option$ | Total$  |\n')
-    fh.write(' +----------+--------+--------+-----------+--------+---------------------+--------------+---------+---------+---------+\n')
+    fh.write(' +----------------+----------+--------+--------+-----------+--------+---------------------+--------------+---------+---------+---------+\n')
+    fh.write(' | Signal         | Variant  | Expiry | Strike | Open Bid  | cc_tv  | Exit Time           | Exit Reason  | Stock$  | Option$ | Total$  |\n')
+    fh.write(' +----------------+----------+--------+--------+-----------+--------+---------------------+--------------+---------+---------+---------+\n')
     for key, variant, cc_tv, result, tr in entry_trade_rows:
-        vkey       = variant['variant_key']
-        exp_str    = variant['expiry_date'].strftime('%y%m%d')
-        strike_str = f"{variant['strike']:.2f}"
-        op_str     = f"{variant['open_price']:.2f}"
-        tv_str     = f"{cc_tv:.2f}"
-        exit_time  = (result.get('cc_close_time') or 'N/A')[:19]
-        reason     = result.get('cc_close_reason', 'N/A')
+        signal_mode = key[0] if isinstance(key, tuple) and len(key) >= 1 else ''
+        vkey        = variant['variant_key']
+        exp_str     = variant['expiry_date'].strftime('%y%m%d')
+        strike_str  = f"{variant['strike']:.2f}"
+        op_str      = f"{variant['open_price']:.2f}"
+        tv_str      = f"{cc_tv:.2f}"
+        exit_time   = (result.get('cc_close_time') or 'N/A')[:19]
+        reason      = result.get('cc_close_reason', 'N/A')
         sp = _fmt_pnl(tr.get('stock_pnl'))
         op = _fmt_pnl(tr.get('option_pnl'))
         cp = _fmt_pnl(tr.get('combined_pnl'))
         fh.write(
-            f" | {vkey:<8} | {exp_str:<6} | {strike_str:>6} | {op_str:>9} "
+            f" | {signal_mode:<14} | {vkey:<8} | {exp_str:<6} | {strike_str:>6} | {op_str:>9} "
             f"| {tv_str:>6} | {exit_time:<19} | {reason:<12} "
             f"| {sp:>7} | {op:>7} | {cp:>7} |\n"
         )
-    fh.write(' +----------+--------+--------+-----------+--------+---------------------+--------------+---------+---------+---------+\n')
+    fh.write(' +----------------+----------+--------+--------+-----------+--------+---------------------+--------------+---------+---------+---------+\n')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -634,7 +682,7 @@ def _log_trade(fh, trade_no, row, entry_snap, entry_trade_rows):
 def restructure_trades(df: pd.DataFrame) -> pd.DataFrame:
     """
     One row per accepted (variant × entry).
-    Drops: model_id, trend, momentum, volatility, volume  (not present).
+    `signal_mode` is preserved as the 3rd column (after batch_no, trade_no).
     Adds:  cc_tv (right after cc_open_price), cc_open_days, days_held.
     """
     if df.empty:
@@ -654,7 +702,7 @@ def restructure_trades(df: pd.DataFrame) -> pd.DataFrame:
         ).round(2)
 
     col_order = [
-        'batch_no', 'trade_no',
+        'batch_no', 'trade_no', 'signal_mode',
         'expiry_label', 'strike_label', 'strike', 'expiry_date',
         'entry_time', 'exit_time',
         'entry_stock_price', 'stock_exit_price',
@@ -676,13 +724,13 @@ def write_summary_csv(summary_df: pd.DataFrame, seq_no: int, run_dir: Path) -> P
         'avg_duration_bars': 'avg_bars_held',
     })
     col_order = [
-        'batch_no', 'expiry_label', 'strike_label', 'variant_key',
+        'batch_no', 'signal_mode', 'expiry_label', 'strike_label', 'variant_key',
         'number_of_trades', 'win_rate',
         'avg_entry_price', 'avg_exit_price', 'avg_bars_held',
         'avg_cc_tv_at_entry',
         'total_pnl', 'avg_pnl', 'profit_factor', 'sharpe', 'max_drawdown',
         'avg_stock_pnl', 'avg_option_pnl',
-        'draws', 'no_quote', 'tv_fail_low', 'tv_fail_high',
+        'draws', 'signal_skip', 'no_quote', 'tv_fail_low', 'tv_fail_high',
         'cooldown_skip', 'accepted', 'batch_full_pct',
         'pnl_positive', 'status',
     ]
@@ -734,7 +782,7 @@ def run_model_set(
         return
     df, signal_idx = window_data
     print(f"[{seq_no}][filter]  {date_start} -> {date_end}: {len(df):,} rows, "
-          f"{len(signal_idx):,} signal-fire bars")
+          f"{len(signal_idx):,} eligible bars")
 
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / f'{seq_no}_run.log'
@@ -767,10 +815,12 @@ def run_model_set(
     if not active.empty:
         best  = active.loc[active['total_pnl'].idxmax()]
         worst = active.loc[active['total_pnl'].idxmin()]
-        print(f"[{seq_no}]  Best  : {best['variant_key']:<12}  "
+        best_tag  = f"{best.get('signal_mode','')}/{best['variant_key']}"
+        worst_tag = f"{worst.get('signal_mode','')}/{worst['variant_key']}"
+        print(f"[{seq_no}]  Best  : {best_tag:<28}  "
               f"P&L=${best['total_pnl']:,.2f}  Sharpe={best['sharpe']:.2f}  "
               f"accepted={int(best['accepted'])}")
-        print(f"[{seq_no}]  Worst : {worst['variant_key']:<12}  "
+        print(f"[{seq_no}]  Worst : {worst_tag:<28}  "
               f"P&L=${worst['total_pnl']:,.2f}  Sharpe={worst['sharpe']:.2f}  "
               f"accepted={int(worst['accepted'])}")
 
@@ -782,8 +832,13 @@ def run_model_set(
 def _run_window(args: tuple) -> int:
     (seq_no, run_dir, date_start, date_end, seed,
      batch_size, cc_tv_min, cc_tv_max, buyback_tv,
-     expiry_filter, strike_filter) = args
-    variants = [(e, s) for e in expiry_filter for s in strike_filter]
+     signal_modes, expiry_filter, strike_filter) = args
+    variants = [
+        (m, e, s)
+        for m in signal_modes
+        for e in expiry_filter
+        for s in strike_filter
+    ]
     run_model_set(
         seq_no, run_dir, date_start, date_end, seed,
         batch_size, cc_tv_min, cc_tv_max, buyback_tv,
@@ -842,10 +897,10 @@ def _score_components(
 
 
 def analyse_variants(df: pd.DataFrame, n_batches: int, run_ts: str = '') -> pd.DataFrame:
-    """One row per variant, ranked by overall score across all windows."""
+    """One row per (signal_mode × expiry × strike), ranked by overall score."""
     active = df[df['number_of_trades'] > 0]
     rows   = []
-    for (el, sl), grp in active.groupby(['expiry_label', 'strike_label']):
+    for (sm, el, sl), grp in active.groupby(['signal_mode', 'expiry_label', 'strike_label']):
         vkey         = f"{el}/{sl}"
         pnl_hit      = float((grp['total_pnl'] > 0).mean())
         sharpe_hit   = float((grp['sharpe']    > 0).mean())
@@ -856,7 +911,6 @@ def analyse_variants(df: pd.DataFrame, n_batches: int, run_ts: str = '') -> pd.D
         total_pnl    = float(grp['total_pnl'].sum())
         avg_per_trade_pnl = total_pnl / total_trades if total_trades > 0 else 0.0
 
-        # weighted average of (avg_bars_held / 390) by number_of_trades
         if 'avg_bars_held' in grp.columns and total_trades > 0:
             avg_days_held = round(
                 float((grp['avg_bars_held'] * grp['number_of_trades']).sum())
@@ -869,6 +923,7 @@ def analyse_variants(df: pd.DataFrame, n_batches: int, run_ts: str = '') -> pd.D
 
         rows.append({
             'run_ts':            run_ts,
+            'signal_mode':       sm,
             'variant_key':       vkey,
             'expiry_label':      el,
             'strike_label':      sl,
@@ -889,7 +944,7 @@ def analyse_variants(df: pd.DataFrame, n_batches: int, run_ts: str = '') -> pd.D
         })
     if not rows:
         return pd.DataFrame(columns=[
-            'run_ts', 'rank', 'variant_key', 'expiry_label', 'strike_label',
+            'run_ts', 'rank', 'signal_mode', 'variant_key', 'expiry_label', 'strike_label',
             'batch_count', 'total_trades', 'avg_trades', 'avg_cc_tv',
             'avg_win_rate', 'avg_total_pnl', 'avg_per_trade_pnl', 'avg_days_held',
             'total_pnl', 'pnl_hit_rate', 'avg_sharpe', 'avg_pf', 'consistency_score',
@@ -900,13 +955,13 @@ def analyse_variants(df: pd.DataFrame, n_batches: int, run_ts: str = '') -> pd.D
 
 
 def aggregate_funnel(df: pd.DataFrame) -> pd.DataFrame:
-    """Sum funnel counters across windows, per variant."""
-    cols = ['draws', 'no_quote', 'tv_fail_low', 'tv_fail_high',
+    """Sum funnel counters across windows, per (signal_mode × expiry × strike)."""
+    cols = ['draws', 'signal_skip', 'no_quote', 'tv_fail_low', 'tv_fail_high',
             'cooldown_skip', 'accepted']
     present = [c for c in cols if c in df.columns]
     if not present:
         return pd.DataFrame()
-    agg = df.groupby(['expiry_label', 'strike_label'])[present].sum().reset_index()
+    agg = df.groupby(['signal_mode', 'expiry_label', 'strike_label'])[present].sum().reset_index()
     agg['accept_pct'] = np.where(
         agg['draws'] > 0, agg['accepted'] / agg['draws'] * 100, 0.0,
     ).round(1)
@@ -923,9 +978,20 @@ def append_to_all_runs(df: pd.DataFrame, run_dir: Path, run_params: dict | None 
         print("[all_runs]  No active rows — skipping.")
         return
 
+    # Auto-migrate pre-signal_mode all_runs.csv: insert signal_mode='both'
+    # (the only mode prior to the 4-mode refactor) so the new header aligns.
+    if all_runs_path.exists():
+        with open(all_runs_path, 'r', encoding='utf-8') as _fh:
+            _first_line = _fh.readline().rstrip('\n')
+        if 'signal_mode' not in _first_line.split(','):
+            print("[all_runs]  Migrating legacy all_runs.csv (adding signal_mode='both') ...")
+            legacy = pd.read_csv(all_runs_path, low_memory=False)
+            strike_pos = legacy.columns.get_loc('strike_label') if 'strike_label' in legacy.columns else len(legacy.columns)
+            legacy.insert(strike_pos, 'signal_mode', 'both')
+            legacy.to_csv(all_runs_path, index=False)
+
     rows = []
-    for (el, sl), grp in active.groupby(['expiry_label', 'strike_label']):
-        vkey    = f"{el}/{sl}"
+    for (sm, el, sl), grp in active.groupby(['signal_mode', 'expiry_label', 'strike_label']):
         n_total = int(grp['number_of_trades'].sum())
         if n_total == 0:
             continue
@@ -951,6 +1017,7 @@ def append_to_all_runs(df: pd.DataFrame, run_dir: Path, run_params: dict | None 
             'cc_tv_min':          p.get('cc_tv_min'),
             'cc_tv_max':          p.get('cc_tv_max'),
             'buyback_tv':         p.get('buyback_tv'),
+            'signal_mode':        sm,
             'expiry_label':       el,
             'strike_label':       sl,
             'avg_stock_pnl':      _wavg('avg_stock_pnl'),
@@ -974,7 +1041,7 @@ def append_to_all_runs(df: pd.DataFrame, run_dir: Path, run_params: dict | None 
         return
     col_order = [
         'run_ts', 'cc_tv_min', 'cc_tv_max', 'buyback_tv',
-        'expiry_label', 'strike_label',
+        'signal_mode', 'expiry_label', 'strike_label',
         'avg_stock_pnl', 'avg_option_pnl', 'avg_total_pnl', 'avg_cc_tv',
         'trade_count', 'win_pct', 'total_pnl', 'avg_per_trade_pnl',
         'sharpe', 'profit_factor', 'max_drawdown', 'avg_bars_held',
@@ -1018,10 +1085,11 @@ def write_markdown_report(
     lines.append(f'| Workers             | {p.get("n_workers","—")} |')
     batch_size  = p.get('batch_size')
     lines.append(f'| Batch size / win    | {batch_size:,} |' if batch_size else '| Batch size / win    | — |')
-    lines.append(f'| Entry signal        | (any bsig_trend) AND (any bsig_momentum) |')
+    lines.append(f'| Entry signal        | per-variant signal_mode (none / trend_only / momentum_only / both) |')
     lines.append(f'| cc_tv range         | ${p.get("cc_tv_min","—")} – ${p.get("cc_tv_max","—")} |')
     lines.append(f'| Buyback tv          | ${p.get("buyback_tv","—")} |')
-    lines.append(f'| Cooldown            | {COOLDOWN_MINUTES} min |')
+    lines.append(f'| Cooldown            | {COOLDOWN_MINUTES} min (per full variant) |')
+    lines.append(f'| Signal modes        | {", ".join(p.get("signal_modes", SIGNAL_MODES))} |')
     lines.append(f'| Expiry labels       | {", ".join(p.get("expiry_labels", []))} |')
     lines.append(f'| Strike labels       | {", ".join(p.get("strike_labels", []))} |')
     lines.append(f'| Variants tested     | {p.get("n_variants","—")} |')
@@ -1046,7 +1114,7 @@ def write_markdown_report(
 
     lines.append('## Variant Rankings\n')
     variant_display = [
-        'run_ts', 'rank', 'variant_key', 'expiry_label', 'strike_label',
+        'run_ts', 'rank', 'signal_mode', 'variant_key', 'expiry_label', 'strike_label',
         'batch_count', 'total_trades', 'avg_trades', 'avg_cc_tv',
         'avg_win_rate', 'avg_total_pnl', 'avg_per_trade_pnl', 'avg_days_held', 'total_pnl',
         'pnl_hit_rate', 'avg_sharpe', 'avg_pf', 'consistency_score',
@@ -1062,13 +1130,15 @@ def write_markdown_report(
 
     lines.append('## Entry Funnel — Aggregate Across Windows\n')
     if not funnel_df.empty:
-        lines.append('| Variant | Draws | No Quote | TV Low | TV High | Cooldown | Accepted | Accept % |')
-        lines.append('|---|---:|---:|---:|---:|---:|---:|---:|')
+        lines.append('| Signal Mode | Variant | Draws | Signal Skip | No Quote | TV Low | TV High | Cooldown | Accepted | Accept % |')
+        lines.append('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|')
         for _, r in funnel_df.iterrows():
             vkey = f"{r['expiry_label']}/{r['strike_label']}"
             lines.append(
+                f"| {r['signal_mode']} "
                 f"| {vkey} "
                 f"| {int(r['draws']):,} "
+                f"| {int(r.get('signal_skip', 0)):,} "
                 f"| {int(r['no_quote']):,} "
                 f"| {int(r['tv_fail_low']):,} "
                 f"| {int(r['tv_fail_high']):,} "
@@ -1137,7 +1207,7 @@ def summarize_run(run_dir: Path):
         'number_of_trades', 'win_rate', 'total_pnl', 'avg_pnl',
         'avg_bars_held', 'profit_factor', 'sharpe', 'max_drawdown',
         'avg_stock_pnl', 'avg_option_pnl', 'avg_cc_tv_at_entry',
-        'draws', 'no_quote', 'tv_fail_low', 'tv_fail_high',
+        'draws', 'signal_skip', 'no_quote', 'tv_fail_low', 'tv_fail_high',
         'cooldown_skip', 'accepted', 'batch_full_pct',
     ]
     for col in numeric_cols:
@@ -1161,12 +1231,13 @@ def summarize_run(run_dir: Path):
     print("  VARIANT RANKINGS")
     print(f"{'='*60}")
     if not variants_df.empty:
-        print(f"  {'Rank':<5} {'Variant':<12} {'Trades':>7}  {'$/trade':>8}  "
+        print(f"  {'Rank':<5} {'Signal':<15} {'Variant':<12} {'Trades':>7}  {'$/trade':>8}  "
               f"{'Total $':>10}  {'Win%':>6}  {'PF':>7}  {'Score':>6}")
         for _, r in variants_df.iterrows():
             pf_disp = '   inf' if np.isinf(r.get('avg_pf', 0)) else f"{r['avg_pf']:>7.2f}"
             print(
                 f"  #{int(r['rank']):<4} "
+                f"{str(r.get('signal_mode','')):<15} "
                 f"{r['variant_key']:<12} "
                 f"{int(r['total_trades']):>6,}   "
                 f"${r['avg_per_trade_pnl']:>7,.2f}  "
@@ -1227,7 +1298,12 @@ if __name__ == '__main__':
         _parser.error(f"Invalid --strike-label value(s): {_invalid_strike}. "
                       f"Choose from {STRIKE_LABELS}")
 
-    _variants_selected = [(e, s) for e in _expiry_filter for s in _strike_filter]
+    _variants_selected = [
+        (m, e, s)
+        for m in SIGNAL_MODES
+        for e in _expiry_filter
+        for s in _strike_filter
+    ]
 
     RANDOM_SEED = _args.seed if _args.seed is not None else secrets.randbelow(2**32)
     N_WORKERS   = _args.workers
@@ -1245,13 +1321,14 @@ if __name__ == '__main__':
     print(f"[main]  Windows     : {N_WINDOWS}  ({WINDOW_DAYS}-day each)")
     print(f"[main]  Date range  : {DATA_FIRST} → {DATA_LAST}")
     print(f"[main]  Batch size  : {_args.batch_size:,} trades/variant/window")
-    print(f"[main]  Entry       : (any bsig_trend) AND (any bsig_momentum)")
+    print(f"[main]  Signal modes: {SIGNAL_MODES}")
     print(f"[main]  cc_tv range : ${_args.cc_tv_min:.2f} – ${_args.cc_tv_max:.2f}")
     print(f"[main]  Buyback tv  : ${_args.buyback_tv:.2f}")
     print(f"[main]  Cooldown    : {COOLDOWN_MINUTES} min")
     print(f"[main]  Expiry      : {_expiry_filter}")
     print(f"[main]  Strike      : {_strike_filter}")
-    print(f"[main]  Variants    : {len(_variants_selected)}")
+    print(f"[main]  Variants    : {len(_variants_selected)}  "
+          f"({len(SIGNAL_MODES)}×{len(_expiry_filter)}×{len(_strike_filter)})")
     print(f"[main]  Output dir  : {run_dir}")
 
     _run_params = {
@@ -1267,6 +1344,7 @@ if __name__ == '__main__':
         'cc_tv_max':     _args.cc_tv_max,
         'buyback_tv':    _args.buyback_tv,
         'cooldown_min':  COOLDOWN_MINUTES,
+        'signal_modes':  SIGNAL_MODES,
         'expiry_labels': _expiry_filter,
         'strike_labels': _strike_filter,
         'n_variants':    len(_variants_selected),
@@ -1308,7 +1386,7 @@ if __name__ == '__main__':
             seq_no, run_dir, date_start, date_end, int(seed),
             _args.batch_size,
             _args.cc_tv_min, _args.cc_tv_max, _args.buyback_tv,
-            _expiry_filter, _strike_filter,
+            SIGNAL_MODES, _expiry_filter, _strike_filter,
         ))
         print(f"  [{seq_no:>3}]  {date_start} -> {date_end}  seed={seed}")
 
