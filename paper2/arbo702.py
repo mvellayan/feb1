@@ -89,10 +89,17 @@ from signals import add_buy_signals  # noqa: E402
 
 PARAMS_FILE = _HERE / 'params.json'
 
+# Per-strategy signal-gate modes.  Each strategy picks one:
+#   none          — no signal filter (always fires; default when omitted)
+#   trend_only    — any bsig_trend == 1
+#   momentum_only — any bsig_momentum == 1
+#   both          — (any trend) AND (any momentum)   (the old fixed behavior)
+SIGNAL_MODES = ('none', 'trend_only', 'momentum_only', 'both')
+
 _STRATEGY_KEYS = (
     'shares_per_position', 'cooldown_minutes',
     'cc_tv_min', 'cc_tv_max', 'buyback_tv',
-    'expiry_label', 'strike_label',
+    'expiry_label', 'strike_label', 'signal_mode',
 )
 
 _DEFAULT_STRATEGY = {
@@ -103,6 +110,7 @@ _DEFAULT_STRATEGY = {
     'buyback_tv':          0.5,
     'expiry_label':        'w0',
     'strike_label':        's-2',
+    'signal_mode':         'none',   # default when omitted from params.json
 }
 
 _DEFAULT_PARAMS = {
@@ -152,6 +160,12 @@ def load_params() -> dict:
         merged['buyback_tv']          = float(merged['buyback_tv'])
         if merged['cc_tv_min'] > merged['cc_tv_max']:
             raise ValueError(f"strategies[{i}] cc_tv_min > cc_tv_max")
+        merged['signal_mode'] = str(merged['signal_mode'])
+        if merged['signal_mode'] not in SIGNAL_MODES:
+            raise ValueError(
+                f"strategies[{i}].signal_mode must be one of "
+                f"{list(SIGNAL_MODES)}: got {merged['signal_mode']!r}"
+            )
         cleaned.append(merged)
     p['strategies'] = cleaned
     return p
@@ -164,17 +178,26 @@ SYMBOL = PARAMS['symbol']
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Buy-signal buckets (union composite: any-trend AND any-momentum)
+# Buy-signal buckets (trend / momentum — per-strategy signal_mode picks the gate)
 TREND    = ['ema', 'macd', 'adx', 'sar', 'don', 'arn', 'vtx']
 MOMENTUM = ['rsi', 'sto', 'cci', 'cmo', 'tsi', 'roc', 'frc', 'srsi', 'rmi', 'macd']
 BSIG_TREND_COLS    = [f'bsig_{k}' for k in TREND]
 BSIG_MOMENTUM_COLS = [f'bsig_{k}' for k in MOMENTUM]
 
+
+def _signal_mode_fires(mode: str, trend_any: bool, mom_any: bool) -> bool:
+    if mode == 'none':          return True
+    if mode == 'trend_only':    return trend_any
+    if mode == 'momentum_only': return mom_any
+    if mode == 'both':          return trend_any and mom_any
+    raise ValueError(f"unknown signal_mode: {mode!r}")
+
 COMMISSION        = 2.00
 CONN_TIMEOUT      = 20
 OPT_QUOTE_TIMEOUT = 5
 MAX_BARS          = 1000        # rolling bar history kept in today-partial file
-EOD_MINUTE        = 15 * 60 + 45  # 15:45
+EOD_MINUTE        = 15 * 60 + 45  # 15:45 — Friday CC expiry handling cutoff
+ENTRY_EARLIEST_MINUTE = 9 * 60 + 35  # 09:35 — no entries considered before this
 REQ_STK_MKTDATA   = 2
 REQ_VIX_MKTDATA   = 3
 REQ_STK_RTBARS    = 4
@@ -989,7 +1012,7 @@ def update_today_partial(df_raw: pd.DataFrame, today: date):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _PS_COLS = [
-    'position_id', 'strategy_id',
+    'position_id', 'strategy_id', 'signal_mode',
     'entry_time', 'entry_price', 'entry_wap', 'shares', 'cash_used',
     'buyback_tv',          # copied from strategy at entry; governs exit
     'atr_at_entry', 'rsi_at_entry', 'adx_at_entry', 'vwap_at_entry',
@@ -1003,7 +1026,8 @@ _PS_COLS = [
 ]
 
 _TX_COLS = [
-    'timestamp', 'position_id', 'strategy_id', 'leg', 'action',
+    'timestamp', 'position_id', 'strategy_id', 'signal_mode',
+    'leg', 'action',
     'symbol', 'local_symbol', 'sec_type', 'quantity',
     'price', 'order_id', 'reason',
 ]
@@ -1023,6 +1047,9 @@ def load_ps() -> pd.DataFrame:
     for c in _PS_COLS:
         if c not in df.columns:
             df[c] = None
+    # Legacy rows written before per-strategy signal_mode existed ran under
+    # the old fixed (trend AND momentum) composite → treat missing as 'both'.
+    df['signal_mode'] = df['signal_mode'].fillna('both').replace('', 'both')
     return df[_PS_COLS]
 
 
@@ -1036,6 +1063,24 @@ def _init_tx_file():
     if not TRANSACTION_CSV.exists():
         with open(TRANSACTION_CSV, 'w', newline='') as f:
             csv.DictWriter(f, fieldnames=_TX_COLS).writeheader()
+        return
+
+    # Migrate legacy transaction.csv that lacks the signal_mode column.
+    # Rewrites once: new header + 'both' back-filled on historical rows (those
+    # all ran under the fixed pre-feature composite gate).
+    with open(TRANSACTION_CSV, newline='') as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or 'signal_mode' in reader.fieldnames:
+            return
+        old_rows = list(reader)
+
+    log.info("[txn] migrating transaction.csv — injecting signal_mode column")
+    with open(TRANSACTION_CSV, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=_TX_COLS, extrasaction='ignore')
+        w.writeheader()
+        for row in old_rows:
+            row.setdefault('signal_mode', 'both')
+            w.writerow(row)
 
 
 def _log_txn(row: dict):
@@ -1510,15 +1555,15 @@ def check_entry_signal(
     chain_df:  pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Every bar: log a per-strategy snapshot (quote, cc_tv, gate decision),
-    then — if the composite fires — try to open a position for each strategy.
-    Composite signal is one of the gates shown in the snapshot.  Actual
-    orders are placed only when ALL gates pass.
+    Every bar: evaluate the buy-signal bitfield once, log a per-strategy
+    snapshot, and try to open a position for each strategy whose
+    signal_mode gate passes.  Strategies with signal_mode='none' fire on
+    every bar.  Entries are considered from ENTRY_EARLIEST_MINUTE (09:35)
+    onward with no upper cutoff.
     """
-    if _ses_minute(bar_dt) >= EOD_MINUTE or df_ext.empty:
+    if _ses_minute(bar_dt) < ENTRY_EARLIEST_MINUTE or df_ext.empty:
         return ps
 
-    # Composite signal — one evaluation per bar, shared by all strategies
     df_sig = add_buy_signals(df_ext.tail(10).copy())
     if df_sig.empty:
         return ps
@@ -1527,23 +1572,23 @@ def check_entry_signal(
                   for c in BSIG_TREND_COLS if int(last.get(c, 0)) == 1]
     mom_hits   = [c.replace('bsig_', '')
                   for c in BSIG_MOMENTUM_COLS if int(last.get(c, 0)) == 1]
-    sig_fires  = bool(trend_hits) and bool(mom_hits)
+    trend_any  = bool(trend_hits)
+    mom_any    = bool(mom_hits)
 
     last_ext = df_ext.iloc[-1]
     entry_px = float(bar['avg_ask'])
 
-    # Per-bar snapshot — runs unconditionally, logs quote + TV + decision
-    # for every strategy.  Returns a cache so _try_open_for_strategy can
-    # reuse the fetched quote / resolved strike on firing bars.
+    # Per-bar snapshot — logs quote + TV + decision for every strategy,
+    # using each strategy's own signal_mode gate.  Returns a cache so
+    # _try_open_for_strategy can reuse the fetched quote.
     quote_cache = _log_strategy_snapshot(
         app, ps, bar_dt, entry_px, params, chain_df,
-        sig_fires, trend_hits, mom_hits,
+        trend_hits, mom_hits, trend_any, mom_any,
     )
 
-    if not sig_fires:
-        return ps
-
     for strategy_id, strat in enumerate(params['strategies']):
+        if not _signal_mode_fires(strat['signal_mode'], trend_any, mom_any):
+            continue
         ps = _try_open_for_strategy(
             app, strategy_id, strat, ps, bar, bar_dt,
             entry_px, last_ext, params, chain_df,
@@ -1559,45 +1604,49 @@ def _log_strategy_snapshot(
     entry_px:    float,
     params:      dict,
     chain_df:    pd.DataFrame,
-    sig_fires:   bool,
     trend_hits:  list,
     mom_hits:    list,
+    trend_any:   bool,
+    mom_any:     bool,
 ) -> dict:
     """
-    For every configured strategy, resolve its (expiry, strike), fetch the
-    live call-option quote, compute cc_tv, evaluate every entry gate, and
-    log a one-line verdict.  Runs on every bar — composite-miss bars included.
+    For every configured strategy, evaluate its signal_mode gate, resolve
+    (expiry, strike), fetch the live call-option quote, compute cc_tv,
+    evaluate every entry gate, and log a one-line verdict.  Runs on every
+    bar — each strategy's `signal` gate is decided by its own signal_mode.
 
     Returns {strategy_id: {'strike','exp_ib','bid','ask'}} so the subsequent
-    entry attempt on firing bars can reuse the same quote without a refetch.
+    entry attempt can reuse the same quote without a refetch.
     """
     log.info(
-        f"[snap] composite: "
+        f"[snap] signals: "
         f"trend={len(trend_hits)}/{len(BSIG_TREND_COLS)} "
         f"({','.join(trend_hits) if trend_hits else '-'})  "
         f"mom={len(mom_hits)}/{len(BSIG_MOMENTUM_COLS)} "
-        f"({','.join(mom_hits) if mom_hits else '-'})  "
-        f"fires={'Y' if sig_fires else 'N'}"
+        f"({','.join(mom_hits) if mom_hits else '-'})"
     )
 
     cache: dict = {}
     cash = current_cash(ps, float(params['starting_cash']))
 
     for strategy_id, strat in enumerate(params['strategies']):
-        exp_label = strat['expiry_label']
+        exp_label  = strat['expiry_label']
         strk_label = strat['strike_label']
+        mode       = strat['signal_mode']
+        sig_fires  = _signal_mode_fires(mode, trend_any, mom_any)
 
         try:
             friday = resolve_expiry_friday(bar_dt.date(), exp_label)
         except ValueError as e:
-            log.info(f"[snap] strat={strategy_id} {exp_label}/{strk_label}  "
-                     f"bad expiry_label: {e}")
+            log.info(f"[snap] strat={strategy_id} mode={mode} "
+                     f"{exp_label}/{strk_label}  bad expiry_label: {e}")
             continue
         exp_ib = friday.strftime('%Y%m%d')
 
         strike = resolve_strike(chain_df, exp_ib, entry_px, strk_label)
         if strike is None:
-            log.info(f"[snap] strat={strategy_id} {exp_label}/{strk_label}  "
+            log.info(f"[snap] strat={strategy_id} mode={mode} "
+                     f"{exp_label}/{strk_label}  "
                      f"no strike in chain at ${entry_px:.2f} exp={exp_ib}")
             continue
 
@@ -1627,7 +1676,7 @@ def _log_strategy_snapshot(
         cash_ok = cash >= cost
 
         gates_failed = []
-        if not sig_fires:   gates_failed.append('signal')
+        if not sig_fires:   gates_failed.append(f'signal({mode})')
         if not cooldown_ok: gates_failed.append('cooldown')
         if not cash_ok:     gates_failed.append('cash')
         if bid is None:     gates_failed.append('no_quote')
@@ -1639,8 +1688,9 @@ def _log_strategy_snapshot(
         bid_s = f'{bid:.2f}' if bid is not None else 'N/A'
         ask_s = f'{ask:.2f}' if ask is not None else 'N/A'
         log.info(
-            f"[snap] strat={strategy_id} {exp_label}/{strk_label} "
-            f"K={strike:g} exp={exp_ib}  bid={bid_s} ask={ask_s}  "
+            f"[snap] strat={strategy_id} mode={mode} "
+            f"{exp_label}/{strk_label} K={strike:g} exp={exp_ib}  "
+            f"bid={bid_s} ask={ask_s}  "
             f"cc_tv={tv_str} in [{tv_min:g},{tv_max:g}]  "
             f"cash=${cash:,.0f}  → {decision}"
         )

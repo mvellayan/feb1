@@ -82,7 +82,7 @@ into `strategies: [ { … } ]` at load time.
 
 ## Entry rule
 
-On every completed 1-min bar (before 15:45):
+On every completed 1-min bar (from 09:35 onward, no upper cutoff):
 
 1. Evaluate the composite signal once: `(any bsig_trend) AND (any bsig_momentum)`
 2. If it fired, walk every strategy in `strategies[]` and independently check:
