@@ -293,7 +293,7 @@ class _DailyDirFileHandler(logging.FileHandler):
 
     def __init__(self, root: Path, name: str, encoding: str = 'utf-8'):
         self._root = Path(root)
-        self._name = name
+        self._fname = name
         self._current_day: str | None = None
         self._ensure_day()
         super().__init__(self.baseFilename, mode='a', encoding=encoding, delay=False)
@@ -303,7 +303,7 @@ class _DailyDirFileHandler(logging.FileHandler):
         if today != self._current_day:
             day_dir = self._root / today
             day_dir.mkdir(parents=True, exist_ok=True)
-            self.baseFilename = str(day_dir / self._name)
+            self.baseFilename = str(day_dir / self._fname)
             self._current_day = today
             return True
         return False
