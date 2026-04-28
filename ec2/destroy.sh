@@ -26,6 +26,15 @@ aws iam delete-instance-profile \
 aws iam detach-role-policy \
   --role-name trading-vm-role \
   --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess 2>/dev/null || true
+aws iam delete-role-policy \
+  --role-name trading-vm-role \
+  --policy-name trading-vm-ec2-self 2>/dev/null || true
+aws iam delete-role-policy \
+  --role-name trading-vm-role \
+  --policy-name trading-vm-sns 2>/dev/null || true
+aws iam delete-role-policy \
+  --role-name trading-vm-role \
+  --policy-name trading-vm-ses 2>/dev/null || true
 aws iam delete-role --role-name trading-vm-role 2>/dev/null || true
 
 echo "Done. Instance terminated and IP released."

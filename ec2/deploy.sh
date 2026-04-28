@@ -83,6 +83,18 @@ if ! aws iam get-role --role-name trading-vm-role &>/dev/null; then
   aws iam attach-role-policy \
     --role-name trading-vm-role \
     --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+  aws iam put-role-policy \
+    --role-name trading-vm-role \
+    --policy-name trading-vm-ec2-self \
+    --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:StopInstances","Resource":"*","Condition":{"StringEquals":{"ec2:ResourceTag/Name":"trading-vm"}}}]}'
+  aws iam put-role-policy \
+    --role-name trading-vm-role \
+    --policy-name trading-vm-sns \
+    --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sns:Publish","Resource":"*"}]}'
+  aws iam put-role-policy \
+    --role-name trading-vm-role \
+    --policy-name trading-vm-ses \
+    --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ses:SendEmail","Resource":"*"}]}'
 fi
 if ! aws iam get-instance-profile --instance-profile-name trading-vm-profile &>/dev/null; then
   aws iam create-instance-profile --instance-profile-name trading-vm-profile

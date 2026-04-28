@@ -64,6 +64,52 @@ from ibapi.contract import ComboLeg, Contract
 from ibapi.order import Order
 from ibapi.wrapper import EWrapper
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ibapi 9.81 monkey-patch: tolerate decimal-string volume in real-time bars.
+# IB servers have started emitting fractional-share volume like
+# b'42.0000000000000000' on certain contracts; the stock decoder calls
+# `int(s)` directly and raises ValueError, killing the daemon thread and
+# silently stalling the bar queue.  Replace processRealTimeBarMsg with a
+# version that parses volume/count via float first.
+#
+# NOTE: Decoder dispatches through `msgId2handleInfo`, a class-level dict
+# that captures direct function references at class-body eval time.  So
+# rewriting `Decoder.processRealTimeBarMsg` alone is ignored — we also
+# have to swap the HandleInfo entry for REAL_TIME_BARS.
+# ──────────────────────────────────────────────────────────────────────────────
+def _patch_ibapi_realtimebar():
+    from ibapi.common import RealTimeBar
+    from ibapi.decoder import Decoder, HandleInfo
+    from ibapi.message import IN
+    from ibapi.utils import decode
+
+    def processRealTimeBarMsg(self, fields):
+        next(fields)              # version
+        decode(int, fields)       # reserved field (ibapi discards too)
+        reqId = decode(int, fields)
+
+        bar = RealTimeBar()
+        bar.time   = decode(int, fields)
+        bar.open   = decode(float, fields)
+        bar.high   = decode(float, fields)
+        bar.low    = decode(float, fields)
+        bar.close  = decode(float, fields)
+        bar.volume = int(decode(float, fields))   # robust: "42.000..." → 42
+        bar.wap    = decode(float, fields)
+        bar.count  = int(decode(float, fields))   # same defensive parse
+
+        self.wrapper.realtimeBar(
+            reqId, bar.time, bar.open, bar.high, bar.low,
+            bar.close, bar.volume, bar.wap, bar.count,
+        )
+
+    Decoder.processRealTimeBarMsg = processRealTimeBarMsg
+    Decoder.msgId2handleInfo[IN.REAL_TIME_BARS] = HandleInfo(proc=processRealTimeBarMsg)
+
+
+_patch_ibapi_realtimebar()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PATHS & EXTERNAL IMPORTS
 # ══════════════════════════════════════════════════════════════════════════════

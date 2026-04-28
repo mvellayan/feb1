@@ -1,0 +1,1 @@
+5 16 * * 1-5 sh /home/ec2-user/Development/feb1/ec2/hibernate_self.sh >> /home/ec2-user/hibernate.log 2>&1
