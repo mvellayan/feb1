@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls /Users/muthu/Development/feb1/reports/*_summary.csv)"
+      "Bash(ls /Users/muthu/Development/feb1/reports/*_summary.csv)",
+      "Bash(python3 -c \"import json;d=json.load\\(open\\('params.json'\\)\\);print\\('num strategies:',len\\(d.get\\('strategies',[]\\)\\)\\);[print\\(' ',i,s\\) for i,s in enumerate\\(d.get\\('strategies',[]\\)\\)]\")",
+      "Bash(python3 -c \"import json,sys;d=json.load\\(sys.stdin\\);print\\('num strategies:',len\\(d.get\\('strategies',[]\\)\\)\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 pnl_report.py 2026-05-18 2026-05-22)",
+      "Bash(python3 -c \"import json;d=json.load\\(open\\('paper2/params.json'\\)\\);print\\('strategies:',len\\(d['strategies']\\)\\);[print\\(f\\\\\"  {i}: {s.get\\('expiry_label'\\)}/{s.get\\('strike_label'\\)} bb={s.get\\('buyback_tv'\\)} tv[{s.get\\('cc_tv_min'\\)},{s.get\\('cc_tv_max'\\)}] cd={s.get\\('cooldown_minutes'\\)} {s.get\\('shares_per_position'\\)}sh\\\\\"\\) for i,s in enumerate\\(d['strategies']\\)]\")"
     ]
   }
 }
