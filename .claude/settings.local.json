@@ -6,7 +6,23 @@
       "Bash(python3 -c \"import json,sys;d=json.load\\(sys.stdin\\);print\\('num strategies:',len\\(d.get\\('strategies',[]\\)\\)\\)\")",
       "Bash(python3 -c ' *)",
       "Bash(python3 pnl_report.py 2026-05-18 2026-05-22)",
-      "Bash(python3 -c \"import json;d=json.load\\(open\\('paper2/params.json'\\)\\);print\\('strategies:',len\\(d['strategies']\\)\\);[print\\(f\\\\\"  {i}: {s.get\\('expiry_label'\\)}/{s.get\\('strike_label'\\)} bb={s.get\\('buyback_tv'\\)} tv[{s.get\\('cc_tv_min'\\)},{s.get\\('cc_tv_max'\\)}] cd={s.get\\('cooldown_minutes'\\)} {s.get\\('shares_per_position'\\)}sh\\\\\"\\) for i,s in enumerate\\(d['strategies']\\)]\")"
+      "Bash(python3 -c \"import json;d=json.load\\(open\\('paper2/params.json'\\)\\);print\\('strategies:',len\\(d['strategies']\\)\\);[print\\(f\\\\\"  {i}: {s.get\\('expiry_label'\\)}/{s.get\\('strike_label'\\)} bb={s.get\\('buyback_tv'\\)} tv[{s.get\\('cc_tv_min'\\)},{s.get\\('cc_tv_max'\\)}] cd={s.get\\('cooldown_minutes'\\)} {s.get\\('shares_per_position'\\)}sh\\\\\"\\) for i,s in enumerate\\(d['strategies']\\)]\")",
+      "Bash(python3 *)",
+      "Bash(awk ' *)",
+      "Bash(awk '{a[NR]=$1;s+=$1} END{print \"  min $\"a[1]\"  median $\"a[int\\(NR/2\\)]\"  max $\"a[NR]\"  avg $\"s/NR\" per share\"}')",
+      "Bash(awk '{s+=$1;n++} END{printf \"  avg stock entry across %d buys: $%.2f\\\\n\", n, s/n}')",
+      "Bash(python all_models.py --data-first 2026-01-02 --data-last 2026-03-25 --params ../../paper2/params.json)",
+      "Bash(pip3 show *)",
+      "Bash(PYTHONPATH=/tmp/ibstub python3 all_models.py --data-first 2026-01-02 --data-last 2026-03-25 --params ../../paper2/params.json)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(mkdir -p paper3)",
+      "Bash(cp paper2/arbo702.py paper3/arbo703.py)",
+      "Bash(sed -n '1133,1146p' paper3/arbo703.py)",
+      "Bash(sed -n '1935,1965p' paper3/arbo703.py)",
+      "Bash(PYTHONPATH=/tmp/ibstub python3 -c ' *)",
+      "Bash(cd *)",
+      "Bash(git commit -q -m ' *)"
     ]
   }
 }
