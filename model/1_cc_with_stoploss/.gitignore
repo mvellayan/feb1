@@ -1,0 +1,2 @@
+# Per-run backtest artifacts (regenerable via model.py)
+reports/
