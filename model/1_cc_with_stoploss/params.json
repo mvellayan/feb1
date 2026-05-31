@@ -1,7 +1,7 @@
 {
   "symbol":                "AAPL",
   "starting_cash":         1000000,
-  "stop_atr_mult":         1.5,
+  "stop_atr_mult":         8,
   "stop_type":             "trailing",
   "stop_basis":            "combo_net",
   "max_quote_age_minutes": 3,
