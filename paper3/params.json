@@ -1,0 +1,24 @@
+{
+  "symbol":              "AAPL",
+  "starting_cash":       1000000,
+  "host":                "127.0.0.1",
+  "port":                7497,
+  "client_id":           3,
+  "retention_days":      30,
+
+  "stop_atr_mult":       5,
+  "stop_basis":          "combo_net",
+  "stop_type":           "trailing",
+  "stale_stop_fallback": "stock_leg",
+
+  "strategies": [
+    {  "shares_per_position": 100,
+        "cooldown_minutes":    15,
+        "cc_tv_min":           1.5,
+        "cc_tv_max":           3.5,
+        "buyback_tv":          0.25,
+        "expiry_label":        "w1",
+        "strike_label":        "s+0",
+        "signal_mode":         "none"}
+  ]
+}
