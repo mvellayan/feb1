@@ -74,6 +74,41 @@ python arbo703.py
 `stop_loss` → `buyback_tv` → Friday expiry.  (The stop is checked first so a
 protective exit pre-empts a buyback.)
 
+## Validation status
+
+**Offline (done):** compiles, imports, `params.json` validates (w1/s+0/k=5,
+stock_leg, client_id 3), and 5/5 behavioral unit tests of `check_cc_stops`
+(combo-net fire/hold, stock-leg fallback fire, skip-mode idle, HWM ratchet).
+
+**Live smoke test (NOT yet done):** requires a reachable TWS/Gateway API + the
+Python `ibapi` client installed + an open market session.  The offline tests
+cannot exercise the IB connection, live market data, or real order placement.
+
+## Smoke test (live TWS, ~10 min, during market hours)
+
+Prereqs: TWS/Gateway running in **paper** mode, **API socket enabled**
+(Edit → Global Config → API → Settings → "Enable ActiveX and Socket Clients"),
+port 7497 (paper TWS), **client_id 3 free** (paper2 uses 2), and `ibapi`
+installed in the runtime.
+
+1. **Deploy:** sync `paper3/` to the box. It needs nothing from `paper2/` —
+   shared imports resolve to `feb1/2_indicator` and `feb1/model/1a`.
+2. **Launch:** `cd paper3 && python arbo703.py`.  In `logs/<today>/ops.log`
+   confirm: connects on **client_id 3** → builds the option chain → startup
+   reconciliation completes without error → enters the bar loop.
+3. **Entry:** on the first signal, confirm a **w1 / s+0** BAG entry opens and a
+   cc market-data subscription is created.
+4. **Exercise the stop (the new code path):** the k=5 stop rarely fires, so for
+   a fast check run a throwaway session with `stop_atr_mult` = **0.1** in
+   `params.json` — it should trip almost immediately.  Confirm a
+   `[CC stop] ... basis=combo_net ... BAG SELL` log line and a
+   `stop_loss_combo_net` row in `data/transaction.csv`.  Then **restore k=5**.
+5. **Stale fallback (optional):** with no live option ask (e.g. just after open
+   before the cc sub warms up), confirm a `basis=stock_fallback` stop can fire.
+6. **Restart-safety:** Ctrl-C and relaunch; confirm `hwm_net` / `hwm_stock`
+   reload from `position_support.csv` and the engine resumes without reopening
+   closed positions.
+
 ## Caveat
 
 `w1/s+0/k=5` is an **in-sample** optimum (one underlier, one window, single-strike
