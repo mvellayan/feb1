@@ -392,7 +392,7 @@ def _setup_logging() -> logging.Logger:
     ch.setFormatter(fmt)
     ch.addFilter(_Pref(market_prefixes, include=False))
 
-    lg = logging.getLogger('arbo702')
+    lg = logging.getLogger('arbo703')
     lg.setLevel(logging.DEBUG)
     if not lg.handlers:
         for handler in (ops, mkt, tr, ch):
@@ -2207,7 +2207,9 @@ def immediate_tv_check(app: IBApp, ps: pd.DataFrame, params: dict,
 
 def main():
     log.info("=" * 72)
-    log.info(f"arbo702 starting up")
+    log.info(f"arbo703 (paper3) starting up — combo-net trailing stop "
+             f"(stop_atr_mult={PARAMS.get('stop_atr_mult')}, "
+             f"fallback={PARAMS.get('stale_stop_fallback')})")
     log.info(f"  symbol={PARAMS['symbol']}  starting_cash=${PARAMS['starting_cash']:,}  "
              f"clientId={PARAMS['client_id']}")
     log.info(f"  strategies: {len(PARAMS['strategies'])}")

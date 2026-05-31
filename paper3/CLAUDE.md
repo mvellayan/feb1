@@ -80,9 +80,17 @@ protective exit pre-empts a buyback.)
 stock_leg, client_id 3), and 5/5 behavioral unit tests of `check_cc_stops`
 (combo-net fire/hold, stock-leg fallback fire, skip-mode idle, HWM ratchet).
 
-**Live smoke test (NOT yet done):** requires a reachable TWS/Gateway API + the
-Python `ibapi` client installed + an open market session.  The offline tests
-cannot exercise the IB connection, live market data, or real order placement.
+**Startup smoke test — PASSED (2026-05-31, paper DU1891025, ibapi 9.81.1):**
+connects on client_id 3 / port 7497 → loads the w1/s+0 + stop params → builds
+the option chain → reconciles (0 active rows, **placed no orders**) → bootstraps
+history → subscribes market data → enters the bar loop cleanly.  My stop
+additions don't break startup.
+
+**Trading smoke test — STILL PENDING (needs an open market):** a live w1/s+0
+entry firing on a signal, a `check_cc_stops` exit firing on a real position
+(force quickly with `stop_atr_mult=0.1`), the stale fallback, and restart-reload
+of `hwm_net`/`hwm_stock` with an open position.  The 2026-05-31 run was a Sunday
+(market closed) so no bars/entries/stops could be exercised.
 
 ## Smoke test (live TWS, ~10 min, during market hours)
 
